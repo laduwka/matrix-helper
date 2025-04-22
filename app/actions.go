@@ -169,7 +169,7 @@ func (a *Actions) LeaveRooms(ctx context.Context, roomsToLeave []RoomToLeave) (i
 				}).Warn("Failed to leave room")
 				return nil
 			}
-
+			time.Sleep(100 * time.Millisecond)
 			a.log.WithField("room_name", room.Name).Info("Successfully left room")
 			a.log.WithFields(logrus.Fields{
 				"room_id":   room.ID,

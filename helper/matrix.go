@@ -286,8 +286,12 @@ func (c *matrixClient) GetLastMessageTimestamp(ctx context.Context, roomID strin
 
 func (c *matrixClient) LeaveRoom(ctx context.Context, roomID string) error {
 	roomName := c.getRoomNameSafe(roomID)
-
-	err := c.retry.Do(ctx, func() error {
+	noRLRetry := NewRetry(
+		c.retryOpts,
+		c.cbOpts,
+		RateLimiterOptions{Enabled: false},
+	)
+	err := noRLRetry.Do(ctx, func() error {
 		_, err := c.client.LeaveRoom(roomID)
 		if err != nil {
 			c.log.WithError(err).WithFields(logrus.Fields{
