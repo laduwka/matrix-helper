@@ -1,0 +1,95 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go-version: ['1.20', '1.21']
+        platform: ['linux/amd64', 'darwin/amd64', 'darwin/arm64', 'windows/amd64']
+        include:
+          - platform: 'linux/amd64'
+            os: 'ubuntu-latest'
+            arch: 'amd64'
+            osname: 'linux'
+          - platform: 'darwin/amd64'
+            os: 'ubuntu-latest'
+            arch: 'amd64'
+            osname: 'darwin'
+          - platform: 'darwin/arm64'
+            os: 'ubuntu-latest'
+            arch: 'arm64'
+            osname: 'darwin'
+          - platform: 'windows/amd64'
+            os: 'ubuntu-latest'
+            arch: 'amd64'
+            osname: 'windows'
+            extension: '.exe'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: ${{ matrix.go-version }}
+
+    - name: Get dependencies
+      run: go mod download
+
+    - name: Run tests
+      run: go test -v ./...
+
+    - name: Build binary
+      run: |
+        GOOS=${{ matrix.osname }} GOARCH=${{ matrix.arch }} go build -v -o matrix-helper-${{ matrix.osname }}-${{ matrix.arch }}${{ matrix.extension }} ./cmd/main.go
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: matrix-helper-${{ matrix.osname }}-${{ matrix.arch }}
+        path: matrix-helper-${{ matrix.osname }}-${{ matrix.arch }}${{ matrix.extension }}
+
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v3
+        with:
+          path: artifacts
+
+      - name: Create release directory
+        run: mkdir release
+
+      - name: Create checksums
+        run: |
+          find artifacts -type f -exec cp {} release/ \;
+          cd release
+          find . -type f -exec sha256sum {} \; > checksums.txt
+
+      - name: Create Release
+        id: create_release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            release/*
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

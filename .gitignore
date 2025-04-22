@@ -1,0 +1,16 @@
+# Binary
+matrix-helper
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+
+# Logs
+*.log
+
+# Config
+config.local.yaml
+.env
