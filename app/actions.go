@@ -15,6 +15,7 @@ import (
 
 type ActionService interface {
 	FindRoomsToLeave(ctx context.Context, days int) ([]RoomToLeave, []helper.Room, error)
+	FindInactiveRoomsToLeave(ctx context.Context, days int) ([]RoomToLeave, []helper.Room, error)
 	LeaveRooms(ctx context.Context, roomsToLeave []RoomToLeave) (int, error)
 	LeaveByDate(ctx context.Context, days int) (leftCount, remainCount int, err error)
 
@@ -169,7 +170,7 @@ func (a *Actions) LeaveRooms(ctx context.Context, roomsToLeave []RoomToLeave) (i
 				}).Warn("Failed to leave room")
 				return nil
 			}
-			time.Sleep(100 * time.Millisecond)
+
 			a.log.WithField("room_name", room.Name).Info("Successfully left room")
 			a.log.WithFields(logrus.Fields{
 				"room_id":   room.ID,
@@ -286,7 +287,7 @@ func (a *Actions) MarkAllRoomsAsRead(ctx context.Context) error {
 				a.log.WithError(err).WithField("room_id", room.ID).Error("Failed to mark room as read")
 				return helper.Wrap(err, fmt.Sprintf("failed to mark room %s as read", room.ID))
 			}
-			time.Sleep(100 * time.Millisecond)
+
 			return nil
 		})
 	}
@@ -339,6 +340,82 @@ func (a *Actions) evaluateRoom(ctx context.Context, room helper.Room, limitTimes
 	if lastActivity < limitTimestamp {
 		daysInactive := int((time.Now().Unix()*1000 - lastActivity) / (86400 * 1000))
 		reason := fmt.Sprintf("Room inactive for %d days and name contains closing keyword", daysInactive)
+		return true, reason, nil
+	}
+
+	return false, "", nil
+}
+
+func (a *Actions) FindInactiveRoomsToLeave(ctx context.Context, days int) ([]RoomToLeave, []helper.Room, error) {
+	a.log.Debug("Fetching rooms to analyze for inactivity")
+
+	rooms, err := a.client.GetRooms(ctx)
+	if err != nil {
+		return nil, nil, helper.Wrap(err, "failed to fetch rooms")
+	}
+
+	limitTimestamp := helper.GetLimitTimestamp(days)
+
+	var roomsToLeave []RoomToLeave
+	var roomsToKeep []helper.Room
+	var mu sync.Mutex
+
+	g, ctx := errgroup.WithContext(ctx)
+	sem := semaphore.NewWeighted(int64(a.maxConcurrency))
+
+	for _, room := range rooms {
+		room := room
+		g.Go(func() error {
+			if err := sem.Acquire(ctx, 1); err != nil {
+				return helper.Wrap(err, "failed to acquire semaphore")
+			}
+			defer sem.Release(1)
+
+			shouldLeave, reason, err := a.evaluateRoomForInactiveLeave(ctx, room, limitTimestamp)
+			if err != nil {
+				a.log.WithError(err).WithFields(logrus.Fields{
+					"room_id":   room.ID,
+					"room_name": room.Name,
+				}).Debug("Error evaluating room for inactivity")
+
+				mu.Lock()
+				roomsToKeep = append(roomsToKeep, room)
+				mu.Unlock()
+				return nil
+			}
+
+			mu.Lock()
+			if shouldLeave {
+				roomsToLeave = append(roomsToLeave, RoomToLeave{Room: room, Reason: reason})
+			} else {
+				roomsToKeep = append(roomsToKeep, room)
+			}
+			mu.Unlock()
+
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return nil, nil, helper.Wrap(err, "error in room evaluation")
+	}
+
+	return roomsToLeave, roomsToKeep, nil
+}
+
+func (a *Actions) evaluateRoomForInactiveLeave(ctx context.Context, room helper.Room, limitTimestamp int64) (bool, string, error) {
+	lastActivity, err := a.client.GetLastMessageTimestamp(ctx, room.ID)
+	if err != nil {
+		if strings.Contains(err.Error(), "no messages") ||
+			strings.Contains(err.Error(), "empty room") {
+			return true, "Room has no messages", nil
+		}
+		return false, "", helper.Wrap(err, "failed to get last message timestamp")
+	}
+
+	if lastActivity < limitTimestamp {
+		daysInactive := int((time.Now().Unix()*1000 - lastActivity) / (86400 * 1000))
+		reason := fmt.Sprintf("Room inactive for %d days", daysInactive)
 		return true, reason, nil
 	}
 

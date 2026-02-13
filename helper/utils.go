@@ -8,10 +8,7 @@ import (
 	"github.com/matrix-org/gomatrix"
 )
 
-const (
-	closedKeyword = "close"
-	doneKeyword   = "done"
-)
+var closeKeywords = []string{"close", "done", "resolved", "completed"}
 
 func GetLimitTimestamp(days int) int64 {
 	return time.Now().AddDate(0, 0, -days).Unix() * 1000
@@ -46,6 +43,10 @@ func RandomInt(min, max int) int {
 
 func HasCloseStatusMessage(roomName string) bool {
 	name := strings.ToLower(roomName)
-	return strings.Contains(name, closedKeyword) ||
-		strings.Contains(name, doneKeyword)
+	for _, kw := range closeKeywords {
+		if strings.Contains(name, kw) {
+			return true
+		}
+	}
+	return false
 }

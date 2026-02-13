@@ -7,6 +7,8 @@ import (
 
 	"github.com/matrix-org/gomatrix"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/semaphore"
 )
 
 type Config struct {
@@ -45,33 +47,36 @@ type Client interface {
 }
 
 type matrixClient struct {
-	client    *gomatrix.Client
-	log       *logrus.Logger
-	config    Config
-	userID    string
-	retry     *Retry
+	client *gomatrix.Client
+	log    *logrus.Logger
+	config Config
+	userID string
+	retry  *Retry
+}
+
+type clientConfig struct {
 	retryOpts RetryOptions
 	cbOpts    CircuitBreakerOptions
 	rlOpts    RateLimiterOptions
 }
 
-type ClientOption func(*matrixClient)
+type ClientOption func(*clientConfig)
 
 func WithRetryOptions(opts RetryOptions) ClientOption {
-	return func(mc *matrixClient) {
-		mc.retryOpts = opts
+	return func(cc *clientConfig) {
+		cc.retryOpts = opts
 	}
 }
 
 func WithCircuitBreakerOptions(opts CircuitBreakerOptions) ClientOption {
-	return func(mc *matrixClient) {
-		mc.cbOpts = opts
+	return func(cc *clientConfig) {
+		cc.cbOpts = opts
 	}
 }
 
 func WithRateLimiterOptions(opts RateLimiterOptions) ClientOption {
-	return func(mc *matrixClient) {
-		mc.rlOpts = opts
+	return func(cc *clientConfig) {
+		cc.rlOpts = opts
 	}
 }
 
@@ -89,20 +94,21 @@ func NewClient(cfg Config, log *logrus.Logger, opts ...ClientOption) (Client, er
 		return nil, Wrap(err, "failed to create matrix client")
 	}
 
-	mc := &matrixClient{
-		client:    client,
-		log:       log,
-		config:    cfg,
+	cc := &clientConfig{
 		retryOpts: DefaultRetryOptions,
 		cbOpts:    DefaultCircuitBreakerOptions,
 		rlOpts:    DefaultRateLimiterOptions,
 	}
-
 	for _, opt := range opts {
-		opt(mc)
+		opt(cc)
 	}
 
-	mc.retry = NewRetry(mc.retryOpts, mc.cbOpts, mc.rlOpts)
+	mc := &matrixClient{
+		client: client,
+		log:    log,
+		config: cfg,
+		retry:  NewRetry(cc.retryOpts, cc.cbOpts, cc.rlOpts),
+	}
 
 	err = mc.retry.Do(context.Background(), func() error {
 		resp, err := client.Login(&gomatrix.ReqLogin{
@@ -135,32 +141,54 @@ func (c *matrixClient) UserID() string {
 }
 
 func (c *matrixClient) GetRooms(ctx context.Context) ([]Room, error) {
-	var rooms []Room
-
+	// Step 1: Get room IDs (single API call, retried)
+	var roomIDs []string
 	err := c.retry.Do(ctx, func() error {
 		resp, err := c.client.JoinedRooms()
 		if err != nil {
 			return Wrap(err, "failed to get joined rooms")
 		}
-
-		rooms = make([]Room, 0, len(resp.JoinedRooms))
-		for _, roomID := range resp.JoinedRooms {
-			room, err := c.getRoomInfo(roomID)
-			if err != nil {
-				c.log.WithError(err).WithField("room_id", roomID).Warn("Failed to get room info")
-				rooms = append(rooms, Room{
-					ID:   roomID,
-					Name: roomID,
-				})
-				continue
-			}
-			rooms = append(rooms, room)
-		}
+		roomIDs = resp.JoinedRooms
 		return nil
 	})
-
 	if err != nil {
-		return nil, Wrap(err, "failed to get rooms after retries")
+		return nil, Wrap(err, "failed to get joined rooms after retries")
+	}
+
+	// Step 2: Get room info concurrently, each call individually rate-limited
+	rooms := make([]Room, len(roomIDs))
+	g, gctx := errgroup.WithContext(ctx)
+	sem := semaphore.NewWeighted(5)
+
+	for i, roomID := range roomIDs {
+		i, roomID := i, roomID
+		g.Go(func() error {
+			if err := sem.Acquire(gctx, 1); err != nil {
+				return err
+			}
+			defer sem.Release(1)
+
+			var room Room
+			err := c.retry.Do(gctx, func() error {
+				r, err := c.getRoomInfo(roomID)
+				if err != nil {
+					return err
+				}
+				room = r
+				return nil
+			})
+			if err != nil {
+				c.log.WithError(err).WithField("room_id", roomID).Warn("Failed to get room info")
+				rooms[i] = Room{ID: roomID, Name: roomID}
+				return nil
+			}
+			rooms[i] = room
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return nil, Wrap(err, "failed to get room info")
 	}
 
 	return rooms, nil
@@ -286,12 +314,7 @@ func (c *matrixClient) GetLastMessageTimestamp(ctx context.Context, roomID strin
 
 func (c *matrixClient) LeaveRoom(ctx context.Context, roomID string) error {
 	roomName := c.getRoomNameSafe(roomID)
-	noRLRetry := NewRetry(
-		c.retryOpts,
-		c.cbOpts,
-		RateLimiterOptions{Enabled: false},
-	)
-	err := noRLRetry.Do(ctx, func() error {
+	err := c.retry.Do(ctx, func() error {
 		_, err := c.client.LeaveRoom(roomID)
 		if err != nil {
 			c.log.WithError(err).WithFields(logrus.Fields{
@@ -306,20 +329,14 @@ func (c *matrixClient) LeaveRoom(ctx context.Context, roomID string) error {
 		}).Info("Successfully left room")
 
 		return nil
-	})
+	}, WithoutRateLimit())
 
 	return err
 }
 
 func (c *matrixClient) MarkRoomAsRead(ctx context.Context, roomID string) error {
 	roomName := c.getRoomNameSafe(roomID)
-
-	noRLRetry := NewRetry(
-		c.retryOpts,
-		c.cbOpts,
-		RateLimiterOptions{Enabled: false},
-	)
-	err := noRLRetry.Do(ctx, func() error {
+	err := c.retry.Do(ctx, func() error {
 		resp, err := c.client.Messages(roomID, "", "", 'b', 1)
 		if err != nil {
 			c.log.WithError(err).WithFields(logrus.Fields{
@@ -353,7 +370,7 @@ func (c *matrixClient) MarkRoomAsRead(ctx context.Context, roomID string) error 
 		}).Debug("Successfully marked room as read")
 
 		return nil
-	})
+	}, WithoutRateLimit())
 
 	return err
 }
