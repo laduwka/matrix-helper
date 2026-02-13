@@ -239,7 +239,7 @@ func (r *Retry) Do(ctx context.Context, operation func() error, opts ...DoOption
 	smart := &smartBackOff{
 		inner:               eb,
 		lastErr:             &lastErr,
-		maxRetries:          uint64(r.retryOpts.MaxAttempts - 1),
+		maxRetries:          uint64(max(r.retryOpts.MaxAttempts-1, 0)),
 		maxRateLimitRetries: 10,
 	}
 	bCtx := backoff.WithContext(smart, ctx)

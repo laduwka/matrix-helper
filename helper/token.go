@@ -11,7 +11,7 @@ import (
 type CachedToken struct {
 	HomeserverURL string    `json:"homeserver_url"`
 	UserID        string    `json:"user_id"`
-	AccessToken   string    `json:"access_token"`
+	AccessToken   string    `json:"access_token"` // #nosec G117 -- stored in local cache file with 0600 permissions
 	DeviceID      string    `json:"device_id"`
 	Username      string    `json:"username"`
 	Domain        string    `json:"domain"`
@@ -31,7 +31,7 @@ func TokenCachePath() string {
 }
 
 func SaveToken(token *CachedToken) error {
-	path := TokenCachePath()
+	path := filepath.Clean(TokenCachePath())
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return Wrap(err, "failed to create token cache directory")
@@ -49,8 +49,8 @@ func SaveToken(token *CachedToken) error {
 }
 
 func LoadToken() (*CachedToken, error) {
-	path := TokenCachePath()
-	data, err := os.ReadFile(path)
+	path := filepath.Clean(TokenCachePath())
+	data, err := os.ReadFile(path) // #nosec G304 -- path from TokenCachePath() is constructed internally
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil
@@ -66,7 +66,7 @@ func LoadToken() (*CachedToken, error) {
 }
 
 func RemoveToken() error {
-	path := TokenCachePath()
+	path := filepath.Clean(TokenCachePath())
 	err := os.Remove(path)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return Wrap(err, "failed to remove token cache file")
