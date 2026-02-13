@@ -153,6 +153,14 @@ var (
 	errorColor   = color.New(color.FgRed)
 )
 
+var progressFn = func(current, total int, message string) {
+	if total == 0 {
+		fmt.Printf("  %s\n", message)
+	} else {
+		fmt.Printf("  %s: %d/%d\n", message, current, total)
+	}
+}
+
 func run(config *RunConfig) error {
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -163,7 +171,8 @@ func run(config *RunConfig) error {
 	var cli *CLI
 	var err error
 
-	if config.Interactive {
+	hasModeFlag := config.LeaveMode || config.LeaveInactiveMode || config.MentionsMode || config.MarkReadMode
+	if !hasModeFlag || config.Interactive {
 		cli, err = initializeInteractiveApp()
 	} else {
 		cli, err = initializeApp()
@@ -300,6 +309,7 @@ func initializeInteractiveApp() (*CLI, error) {
 		client,
 		log,
 		app.WithConcurrency(5),
+		app.WithProgress(progressFn),
 	)
 
 	return &CLI{
@@ -361,6 +371,7 @@ func initializeApp() (*CLI, error) {
 		client,
 		log,
 		app.WithConcurrency(5),
+		app.WithProgress(progressFn),
 	)
 
 	return &CLI{
