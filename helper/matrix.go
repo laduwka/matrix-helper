@@ -16,6 +16,7 @@ type Config struct {
 	Username      string
 	Password      string
 	Domain        string
+	DeviceID      string
 }
 
 type Message struct {
@@ -51,14 +52,18 @@ type Client interface {
 
 	Config() Config
 	UserID() string
+	AccessToken() string
+	DeviceID() string
 }
 
 type matrixClient struct {
-	client *gomatrix.Client
-	log    *logrus.Logger
-	config Config
-	userID string
-	retry  *Retry
+	client      *gomatrix.Client
+	log         *logrus.Logger
+	config      Config
+	userID      string
+	accessToken string
+	deviceID    string
+	retry       *Retry
 }
 
 type clientConfig struct {
@@ -128,9 +133,11 @@ func NewClient(cfg Config, log *logrus.Logger, opts ...ClientOption) (Client, er
 
 	err = mc.retry.Do(context.Background(), func() error {
 		resp, err := client.Login(&gomatrix.ReqLogin{
-			Type:     "m.login.password",
-			User:     cfg.Username,
-			Password: cfg.Password,
+			Type:                     "m.login.password",
+			User:                     cfg.Username,
+			Password:                 cfg.Password,
+			DeviceID:                 cfg.DeviceID,
+			InitialDeviceDisplayName: "matrix-helper",
 		})
 		if err != nil {
 			return Wrap(err, "failed to login")
@@ -138,6 +145,8 @@ func NewClient(cfg Config, log *logrus.Logger, opts ...ClientOption) (Client, er
 
 		client.SetCredentials(resp.UserID, resp.AccessToken)
 		mc.userID = resp.UserID
+		mc.accessToken = resp.AccessToken
+		mc.deviceID = resp.DeviceID
 		return nil
 	})
 
@@ -154,6 +163,89 @@ func (c *matrixClient) Config() Config {
 
 func (c *matrixClient) UserID() string {
 	return c.userID
+}
+
+func (c *matrixClient) AccessToken() string {
+	return c.accessToken
+}
+
+func (c *matrixClient) DeviceID() string {
+	return c.deviceID
+}
+
+type whoamiResponse struct {
+	UserID string `json:"user_id"`
+}
+
+func NewClientFromToken(token *CachedToken, log *logrus.Logger, opts ...ClientOption) (Client, error) {
+	client, err := gomatrix.NewClient(token.HomeserverURL, token.UserID, token.AccessToken)
+	if err != nil {
+		return nil, Wrap(err, "failed to create matrix client from token")
+	}
+
+	cc := &clientConfig{
+		retryOpts: DefaultRetryOptions,
+		cbOpts:    DefaultCircuitBreakerOptions,
+		rlOpts:    DefaultRateLimiterOptions,
+	}
+	for _, opt := range opts {
+		opt(cc)
+	}
+
+	client.Client = &http.Client{
+		Transport: &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 10,
+			IdleConnTimeout:     90 * time.Second,
+		},
+		Timeout: 2 * time.Minute,
+	}
+
+	var resp whoamiResponse
+	err = client.MakeRequest(
+		"GET",
+		client.BuildURL("account", "whoami"),
+		nil,
+		&resp,
+	)
+	if err != nil {
+		return nil, Wrap(err, "cached token is invalid")
+	}
+	if resp.UserID != token.UserID {
+		return nil, fmt.Errorf("token user_id mismatch: expected %s, got %s", token.UserID, resp.UserID)
+	}
+
+	mc := &matrixClient{
+		client: client,
+		log:    log,
+		config: Config{
+			HomeserverURL: token.HomeserverURL,
+			Username:      token.Username,
+			Domain:        token.Domain,
+			DeviceID:      token.DeviceID,
+		},
+		userID:      token.UserID,
+		accessToken: token.AccessToken,
+		deviceID:    token.DeviceID,
+		retry:       NewRetry(cc.retryOpts, cc.cbOpts, cc.rlOpts),
+	}
+
+	return mc, nil
+}
+
+func LogoutAndCleanup(token *CachedToken) error {
+	client, err := gomatrix.NewClient(token.HomeserverURL, token.UserID, token.AccessToken)
+	if err != nil {
+		_ = RemoveToken()
+		return Wrap(err, "failed to create client for logout")
+	}
+
+	_, err = client.Logout()
+	_ = RemoveToken()
+	if err != nil {
+		return Wrap(err, "failed to logout from server")
+	}
+	return nil
 }
 
 const syncFilter = `{"presence":{"types":[]},"account_data":{"types":[]},"room":{"state":{"types":["m.room.name","m.room.topic"]},"timeline":{"limit":1},"ephemeral":{"types":[]},"account_data":{"types":[]}}}`
@@ -400,4 +492,3 @@ func (m *Message) ContainsMention(username string) bool {
 	mentionFormat := fmt.Sprintf("@%s:", username)
 	return strings.Contains(body, mentionFormat)
 }
-

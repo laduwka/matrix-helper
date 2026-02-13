@@ -14,19 +14,19 @@ import (
 
 // mockClient implements helper.Client for testing
 type mockClient struct {
-	rooms              []helper.Room
-	roomsWithTimeline  []helper.RoomWithTimeline
-	getRoomsErr        error
-	leaveRoomErr       error
-	leaveRoomCalls     []string
-	messages           map[string][]helper.Message
-	getMessagesErr     error
-	lastTimestamp      map[string]int64
-	lastTimestampErr   map[string]error
-	markAsReadErr      error
-	markAsReadCalls    []string
-	config             helper.Config
-	userID             string
+	rooms             []helper.Room
+	roomsWithTimeline []helper.RoomWithTimeline
+	getRoomsErr       error
+	leaveRoomErr      error
+	leaveRoomCalls    []string
+	messages          map[string][]helper.Message
+	getMessagesErr    error
+	lastTimestamp     map[string]int64
+	lastTimestampErr  map[string]error
+	markAsReadErr     error
+	markAsReadCalls   []string
+	config            helper.Config
+	userID            string
 }
 
 func newMockClient() *mockClient {
@@ -96,6 +96,14 @@ func (m *mockClient) Config() helper.Config {
 
 func (m *mockClient) UserID() string {
 	return m.userID
+}
+
+func (m *mockClient) AccessToken() string {
+	return ""
+}
+
+func (m *mockClient) DeviceID() string {
+	return ""
 }
 
 func newTestActions(client helper.Client) ActionService {

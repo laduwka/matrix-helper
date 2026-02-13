@@ -11,6 +11,7 @@ A Go CLI tool for managing Matrix chat rooms: leave inactive rooms, find mention
 - **Find mentions**: Locate rooms where you were mentioned, with direct links to Element and web interfaces
 - **Mark all as read**: Clear unread status for all rooms with a single command
 - **Interactive mode**: Enter credentials via terminal with masked password input
+- **Session caching**: Access token is cached after first login; subsequent runs reuse it without re-prompting
 - **Reliable API handling**: Built-in retry with exponential backoff, circuit breaker, and rate limiter
 
 ## Requirements
@@ -57,6 +58,8 @@ Run with `-i` flag to enter credentials manually:
 matrix-helper -i
 ```
 
+On first run, you'll be prompted for domain, username, and password. After a successful login the access token is cached locally, so subsequent runs skip the credential prompt. Use `--logout` to revoke the cached session.
+
 ## Usage
 
 ### CLI flags
@@ -66,6 +69,7 @@ matrix-helper -i
 | `-h`, `--help` | Display help |
 | `--version` | Display version |
 | `-i` | Interactive mode (prompt for credentials) |
+| `--logout` | Revoke cached session and remove stored token |
 | `--leave` | Leave rooms mode (by closing keywords) |
 | `--leave-inactive` | Leave all inactive rooms mode |
 | `--days=N` | Number of days of inactivity |
@@ -94,7 +98,22 @@ matrix-helper --mark-read
 
 # Interactive mode
 matrix-helper -i
+
+# Logout (revoke cached token)
+matrix-helper --logout
 ```
+
+## Session Caching
+
+In interactive mode (`-i`), the access token is cached after the first successful login:
+
+- **Location**: `$XDG_RUNTIME_DIR/matrix-helper/token.json` (falls back to `~/.cache/matrix-helper/token.json`)
+- **Permissions**: directory `0700`, file `0600` (owner-only access)
+- **Validation**: the cached token is verified via the Matrix `/account/whoami` endpoint on each run; if invalid, you'll be prompted for credentials again
+- **No password stored**: only the access token is cached, never your password
+- **Logout**: run `matrix-helper --logout` to revoke the token server-side and remove the local cache
+
+On systems using `$XDG_RUNTIME_DIR` (most Linux distributions), the token is stored on tmpfs and automatically cleared on logout/reboot.
 
 ## License
 

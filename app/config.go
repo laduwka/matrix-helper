@@ -15,6 +15,7 @@ type MatrixConfig struct {
 	Username    string `envconfig:"USERNAME" required:"true"`
 	Password    string `envconfig:"PASSWORD" required:"true"`
 	DisplayName string `envconfig:"DISPLAY_NAME"`
+	DeviceID    string `envconfig:"DEVICE_ID"`
 
 	HomeserverURL string `envconfig:"-"`
 }
@@ -25,6 +26,7 @@ func (m MatrixConfig) ToMatrixConfig() helper.Config {
 		Username:      m.Username,
 		Password:      m.Password,
 		HomeserverURL: m.HomeserverURL,
+		DeviceID:      m.DeviceID,
 	}
 }
 

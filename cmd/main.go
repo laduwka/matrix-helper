@@ -45,6 +45,8 @@ func main() {
 
 	interactiveFlag := flag.Bool("i", false, "Interactive mode with credential prompting")
 
+	logoutFlag := flag.Bool("logout", false, "Revoke cached session and remove stored token")
+
 	flag.Parse()
 
 	if *helpFlag || *hFlag {
@@ -66,6 +68,7 @@ func main() {
 		MentionsDays:      *mentionsDays,
 		MarkReadMode:      *markReadFlag,
 		Interactive:       *interactiveFlag,
+		Logout:            *logoutFlag,
 	}
 
 	if err := run(config); err != nil {
@@ -80,6 +83,7 @@ type RunConfig struct {
 	MentionsMode      bool
 	MarkReadMode      bool
 	Interactive       bool
+	Logout            bool
 
 	LeaveInactiveDays int
 	MentionsDays      int
@@ -99,6 +103,7 @@ func printHelp() {
 	fmt.Println("  -h, --help     Display this help message")
 	fmt.Println("  --version      Display version information")
 	fmt.Println("  -i             Interactive mode (prompt for credentials)")
+	fmt.Println("  --logout       Revoke cached session and remove stored token")
 
 	fmt.Println("\nLEAVE ROOMS MODE:")
 	fmt.Println("  --leave        Activate leave rooms mode")
@@ -162,6 +167,9 @@ var progressFn = func(current, total int, message string) {
 }
 
 func run(config *RunConfig) error {
+	if config.Logout {
+		return runLogout()
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -252,41 +260,76 @@ func promptCredentials() (domain, username, password string, err error) {
 	return domain, username, password, nil
 }
 
+func interactiveClientOpts(log *logrus.Logger) []helper.ClientOption {
+	return []helper.ClientOption{
+		helper.WithRetryOptions(helper.RetryOptions{
+			MaxAttempts: 3,
+			BaseDelay:   time.Second,
+			MaxDelay:    time.Second * 5,
+			UseJitter:   true,
+		}),
+		helper.WithCircuitBreakerOptions(helper.CircuitBreakerOptions{
+			Threshold: 5,
+			Timeout:   time.Minute * 2,
+			Enabled:   true,
+			ShouldTrip: func(err error) bool {
+				return !strings.Contains(err.Error(), "rate limit") &&
+					!strings.Contains(err.Error(), "M_LIMIT_EXCEEDED")
+			},
+			OnStateChange: func(from, to string) {
+				log.Infof("Circuit breaker state changed from %s to %s", from, to)
+			},
+		}),
+		helper.WithRateLimiterOptions(helper.RateLimiterOptions{
+			Rate:     20,
+			Interval: time.Minute,
+			Capacity: 5,
+			Enabled:  true,
+		}),
+	}
+}
+
 func initializeInteractiveApp() (*CLI, error) {
+	log := app.NewLogger(app.LoggerConfig{Level: "info", Format: "text"})
+
+	// Try cached token first
+	cached, err := helper.LoadToken()
+	if err != nil {
+		warnColor.Printf("Warning: failed to load cached session: %v\n", err)
+	}
+
+	if cached != nil {
+		successColor.Printf("Found cached session for %s\n", cached.UserID)
+		successColor.Printf("Connecting to %s...\n", cached.HomeserverURL)
+
+		client, err := helper.NewClientFromToken(cached, log, interactiveClientOpts(log)...)
+		if err != nil {
+			warnColor.Printf("Cached session is invalid: %v\n", err)
+			warnColor.Println("Falling back to credential prompt...")
+			_ = helper.RemoveToken()
+			fmt.Println()
+		} else {
+			successColor.Println("Connected successfully!")
+			fmt.Println()
+
+			actionService := app.NewActions(
+				client,
+				log,
+				app.WithConcurrency(5),
+				app.WithProgress(progressFn),
+			)
+			return &CLI{actions: actionService, log: log}, nil
+		}
+	}
+
+	// No valid cached token — prompt for credentials
 	domain, username, password, err := promptCredentials()
 	if err != nil {
 		return nil, err
 	}
 
 	cfg := app.LoadFromValues(domain, username, password)
-	log := app.NewLogger(cfg.Log.ToLoggerConfig())
-
-	retryOpts := helper.RetryOptions{
-		MaxAttempts: 3,
-		BaseDelay:   time.Second,
-		MaxDelay:    time.Second * 5,
-		UseJitter:   true,
-	}
-
-	cbOpts := helper.CircuitBreakerOptions{
-		Threshold: 5,
-		Timeout:   time.Minute * 2,
-		Enabled:   true,
-		ShouldTrip: func(err error) bool {
-			return !strings.Contains(err.Error(), "rate limit") &&
-				!strings.Contains(err.Error(), "M_LIMIT_EXCEEDED")
-		},
-		OnStateChange: func(from, to string) {
-			log.Infof("Circuit breaker state changed from %s to %s", from, to)
-		},
-	}
-
-	rlOpts := helper.RateLimiterOptions{
-		Rate:     20,
-		Interval: time.Minute,
-		Capacity: 5,
-		Enabled:  true,
-	}
+	log = app.NewLogger(cfg.Log.ToLoggerConfig())
 
 	fmt.Println()
 	successColor.Printf("Connecting to %s...\n", cfg.Matrix.HomeserverURL)
@@ -294,15 +337,29 @@ func initializeInteractiveApp() (*CLI, error) {
 	client, err := helper.NewClient(
 		cfg.Matrix.ToMatrixConfig(),
 		log,
-		helper.WithRetryOptions(retryOpts),
-		helper.WithCircuitBreakerOptions(cbOpts),
-		helper.WithRateLimiterOptions(rlOpts),
+		interactiveClientOpts(log)...,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize matrix client: %w", err)
 	}
 
 	successColor.Println("Connected successfully!")
+
+	// Cache the token for future runs
+	token := &helper.CachedToken{
+		HomeserverURL: cfg.Matrix.HomeserverURL,
+		UserID:        client.UserID(),
+		AccessToken:   client.AccessToken(),
+		DeviceID:      client.DeviceID(),
+		Username:      username,
+		Domain:        domain,
+		CreatedAt:     time.Now(),
+	}
+	if err := helper.SaveToken(token); err != nil {
+		warnColor.Printf("Warning: failed to cache session: %v\n", err)
+	} else {
+		successColor.Println("Session cached for future runs")
+	}
 	fmt.Println()
 
 	actionService := app.NewActions(
@@ -316,6 +373,27 @@ func initializeInteractiveApp() (*CLI, error) {
 		actions: actionService,
 		log:     log,
 	}, nil
+}
+
+func runLogout() error {
+	token, err := helper.LoadToken()
+	if err != nil {
+		return fmt.Errorf("failed to load cached session: %w", err)
+	}
+	if token == nil {
+		fmt.Println("No cached session found.")
+		return nil
+	}
+
+	fmt.Printf("Logging out session for %s...\n", token.UserID)
+	if err := helper.LogoutAndCleanup(token); err != nil {
+		warnColor.Printf("Warning: server-side logout failed: %v\n", err)
+		fmt.Println("Local token has been removed.")
+		return nil
+	}
+
+	successColor.Println("Logged out successfully. Cached session removed.")
+	return nil
 }
 
 func initializeApp() (*CLI, error) {
