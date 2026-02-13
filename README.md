@@ -105,5 +105,7 @@ MIT License
 - [gomatrix](https://github.com/matrix-org/gomatrix) - Matrix client for Go
 - [cenkalti/backoff](https://github.com/cenkalti/backoff) - Retry with exponential backoff
 - [sony/gobreaker](https://github.com/sony/gobreaker) - Circuit breaker
+- [golang.org/x/time/rate](https://pkg.go.dev/golang.org/x/time/rate) - Rate limiter
+- [golang.org/x/sync](https://pkg.go.dev/golang.org/x/sync) - Concurrency primitives (errgroup, semaphore)
 - [logrus](https://github.com/sirupsen/logrus) - Logging
 - [fatih/color](https://github.com/fatih/color) - Colored terminal output

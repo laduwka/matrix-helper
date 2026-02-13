@@ -3,12 +3,12 @@ package helper
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"strings"
+	"time"
 
 	"github.com/matrix-org/gomatrix"
 	"github.com/sirupsen/logrus"
-	"golang.org/x/sync/errgroup"
-	"golang.org/x/sync/semaphore"
 )
 
 type Config struct {
@@ -27,20 +27,27 @@ type Message struct {
 }
 
 type Room struct {
-	ID          string
-	Name        string
-	Topic       string
-	MemberCount int
-	JoinedAt    int64
+	ID           string
+	Name         string
+	Topic        string
+	LastActivity int64
+	LastEventID  string
+}
+
+type RoomWithTimeline struct {
+	Room
+	TimelineEvents  []Message
+	TimelineLimited bool
 }
 
 type Client interface {
-	GetRooms(ctx context.Context) ([]Room, error)
-	LeaveRoom(ctx context.Context, roomID string) error
+	GetRoomsViaSync(ctx context.Context) ([]Room, error)
+	GetRoomsWithTimeline(ctx context.Context, timelineLimit int) ([]RoomWithTimeline, error)
+	LeaveRoom(ctx context.Context, roomID, roomName string) error
 
 	GetMessages(ctx context.Context, roomID string, since int64) ([]Message, error)
 	GetLastMessageTimestamp(ctx context.Context, roomID string) (int64, error)
-	MarkRoomAsRead(ctx context.Context, roomID string) error
+	MarkRoomAsRead(ctx context.Context, roomID, roomName, lastEventID string) error
 
 	Config() Config
 	UserID() string
@@ -103,6 +110,15 @@ func NewClient(cfg Config, log *logrus.Logger, opts ...ClientOption) (Client, er
 		opt(cc)
 	}
 
+	client.Client = &http.Client{
+		Transport: &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 10,
+			IdleConnTimeout:     90 * time.Second,
+		},
+		Timeout: 2 * time.Minute,
+	}
+
 	mc := &matrixClient{
 		client: client,
 		log:    log,
@@ -140,108 +156,112 @@ func (c *matrixClient) UserID() string {
 	return c.userID
 }
 
-func (c *matrixClient) GetRooms(ctx context.Context) ([]Room, error) {
-	// Step 1: Get room IDs (single API call, retried)
-	var roomIDs []string
+const syncFilter = `{"presence":{"types":[]},"account_data":{"types":[]},"room":{"state":{"types":["m.room.name","m.room.topic"]},"timeline":{"limit":1},"ephemeral":{"types":[]},"account_data":{"types":[]}}}`
+
+func (c *matrixClient) GetRoomsViaSync(ctx context.Context) ([]Room, error) {
+	var resp *gomatrix.RespSync
 	err := c.retry.Do(ctx, func() error {
-		resp, err := c.client.JoinedRooms()
+		var err error
+		resp, err = c.client.SyncRequest(0, "", syncFilter, true, "offline")
 		if err != nil {
-			return Wrap(err, "failed to get joined rooms")
+			return Wrap(err, "failed to sync")
 		}
-		roomIDs = resp.JoinedRooms
 		return nil
 	})
 	if err != nil {
-		return nil, Wrap(err, "failed to get joined rooms after retries")
+		return nil, Wrap(err, "failed to sync after retries")
 	}
 
-	// Step 2: Get room info concurrently, each call individually rate-limited
-	rooms := make([]Room, len(roomIDs))
-	g, gctx := errgroup.WithContext(ctx)
-	sem := semaphore.NewWeighted(5)
+	rooms := make([]Room, 0, len(resp.Rooms.Join))
+	for roomID, joinedRoom := range resp.Rooms.Join {
+		room := Room{ID: roomID, Name: roomID}
 
-	for i, roomID := range roomIDs {
-		i, roomID := i, roomID
-		g.Go(func() error {
-			if err := sem.Acquire(gctx, 1); err != nil {
-				return err
-			}
-			defer sem.Release(1)
-
-			var room Room
-			err := c.retry.Do(gctx, func() error {
-				r, err := c.getRoomInfo(roomID)
-				if err != nil {
-					return err
+		for _, ev := range joinedRoom.State.Events {
+			switch ev.Type {
+			case "m.room.name":
+				if name, ok := ev.Content["name"].(string); ok && name != "" {
+					room.Name = name
 				}
-				room = r
-				return nil
-			})
-			if err != nil {
-				c.log.WithError(err).WithField("room_id", roomID).Warn("Failed to get room info")
-				rooms[i] = Room{ID: roomID, Name: roomID}
-				return nil
+			case "m.room.topic":
+				if topic, ok := ev.Content["topic"].(string); ok {
+					room.Topic = topic
+				}
 			}
-			rooms[i] = room
-			return nil
-		})
-	}
+		}
 
-	if err := g.Wait(); err != nil {
-		return nil, Wrap(err, "failed to get room info")
+		if len(joinedRoom.Timeline.Events) > 0 {
+			last := joinedRoom.Timeline.Events[len(joinedRoom.Timeline.Events)-1]
+			room.LastActivity = last.Timestamp
+			room.LastEventID = last.ID
+		}
+
+		rooms = append(rooms, room)
 	}
 
 	return rooms, nil
 }
 
-func (c *matrixClient) getRoomInfo(roomID string) (Room, error) {
-	room := Room{
-		ID: roomID,
+func (c *matrixClient) GetRoomsWithTimeline(ctx context.Context, timelineLimit int) ([]RoomWithTimeline, error) {
+	filter := fmt.Sprintf(
+		`{"presence":{"types":[]},"account_data":{"types":[]},"room":{"state":{"types":["m.room.name","m.room.topic"]},"timeline":{"limit":%d},"ephemeral":{"types":[]},"account_data":{"types":[]}}}`,
+		timelineLimit,
+	)
+
+	var resp *gomatrix.RespSync
+	err := c.retry.Do(ctx, func() error {
+		var err error
+		resp, err = c.client.SyncRequest(0, "", filter, true, "offline")
+		if err != nil {
+			return Wrap(err, "failed to sync")
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, Wrap(err, "failed to sync after retries")
 	}
 
-	var nameContent struct {
-		Name string `json:"name"`
-	}
-	err := c.client.StateEvent(roomID, "m.room.name", "", &nameContent)
-	if err == nil && nameContent.Name != "" {
-		room.Name = nameContent.Name
-	} else {
-		room.Name = roomID
+	rooms := make([]RoomWithTimeline, 0, len(resp.Rooms.Join))
+	for roomID, joinedRoom := range resp.Rooms.Join {
+		room := RoomWithTimeline{
+			Room:            Room{ID: roomID, Name: roomID},
+			TimelineLimited: joinedRoom.Timeline.Limited,
+		}
+
+		for _, ev := range joinedRoom.State.Events {
+			switch ev.Type {
+			case "m.room.name":
+				if name, ok := ev.Content["name"].(string); ok && name != "" {
+					room.Name = name
+				}
+			case "m.room.topic":
+				if topic, ok := ev.Content["topic"].(string); ok {
+					room.Topic = topic
+				}
+			}
+		}
+
+		if len(joinedRoom.Timeline.Events) > 0 {
+			last := joinedRoom.Timeline.Events[len(joinedRoom.Timeline.Events)-1]
+			room.LastActivity = last.Timestamp
+			room.LastEventID = last.ID
+		}
+
+		for _, ev := range joinedRoom.Timeline.Events {
+			if ev.Type == "m.room.message" {
+				room.TimelineEvents = append(room.TimelineEvents, Message{
+					ID:        ev.ID,
+					Sender:    ev.Sender,
+					Content:   ev.Content,
+					Type:      ev.Type,
+					Timestamp: ev.Timestamp,
+				})
+			}
+		}
+
+		rooms = append(rooms, room)
 	}
 
-	var topicContent struct {
-		Topic string `json:"topic"`
-	}
-	err = c.client.StateEvent(roomID, "m.room.topic", "", &topicContent)
-	if err == nil {
-		room.Topic = topicContent.Topic
-	}
-
-	return room, nil
-}
-
-func (c *matrixClient) getRoomNameSafe(roomID string) string {
-	var nameContent struct {
-		Name string `json:"name"`
-	}
-	err := c.client.StateEvent(roomID, "m.room.name", "", &nameContent)
-
-	if err == nil && nameContent.Name != "" {
-		return nameContent.Name
-	}
-
-	var summaryContent struct {
-		Heroes      []string `json:"m.heroes"`
-		Invitecount int      `json:"m.invited_member_count"`
-		Joincount   int      `json:"m.joined_member_count"`
-	}
-
-	err = c.client.StateEvent(roomID, "m.room.summary", "", &summaryContent)
-	if err == nil && len(summaryContent.Heroes) > 0 {
-		return "Direct chat with " + strings.Join(summaryContent.Heroes, ", ")
-	}
-
-	return roomID
+	return rooms, nil
 }
 
 func (c *matrixClient) GetMessages(ctx context.Context, roomID string, since int64) ([]Message, error) {
@@ -301,10 +321,7 @@ func (c *matrixClient) GetLastMessageTimestamp(ctx context.Context, roomID strin
 
 	if err != nil {
 
-		c.log.WithError(err).WithFields(logrus.Fields{
-			"room_id":   roomID,
-			"room_name": c.getRoomNameSafe(roomID),
-		}).Debug("Failed to get last message timestamp")
+		c.log.WithError(err).WithField("room_id", roomID).Debug("Failed to get last message timestamp")
 
 		return 0, Wrap(err, "failed to get last message timestamp")
 	}
@@ -312,8 +329,7 @@ func (c *matrixClient) GetLastMessageTimestamp(ctx context.Context, roomID strin
 	return timestamp, nil
 }
 
-func (c *matrixClient) LeaveRoom(ctx context.Context, roomID string) error {
-	roomName := c.getRoomNameSafe(roomID)
+func (c *matrixClient) LeaveRoom(ctx context.Context, roomID, roomName string) error {
 	err := c.retry.Do(ctx, func() error {
 		_, err := c.client.LeaveRoom(roomID)
 		if err != nil {
@@ -334,26 +350,27 @@ func (c *matrixClient) LeaveRoom(ctx context.Context, roomID string) error {
 	return err
 }
 
-func (c *matrixClient) MarkRoomAsRead(ctx context.Context, roomID string) error {
-	roomName := c.getRoomNameSafe(roomID)
+func (c *matrixClient) MarkRoomAsRead(ctx context.Context, roomID, roomName, lastEventID string) error {
 	err := c.retry.Do(ctx, func() error {
-		resp, err := c.client.Messages(roomID, "", "", 'b', 1)
-		if err != nil {
-			c.log.WithError(err).WithFields(logrus.Fields{
-				"room_id":   roomID,
-				"room_name": roomName,
-			}).Debug("Failed to get messages for marking room as read")
-			return Wrap(err, "failed to get messages")
+		eventID := lastEventID
+		if eventID == "" {
+			resp, err := c.client.Messages(roomID, "", "", 'b', 1)
+			if err != nil {
+				c.log.WithError(err).WithFields(logrus.Fields{
+					"room_id":   roomID,
+					"room_name": roomName,
+				}).Debug("Failed to get messages for marking room as read")
+				return Wrap(err, "failed to get messages")
+			}
+			if len(resp.Chunk) == 0 {
+				return nil
+			}
+			eventID = resp.Chunk[0].ID
 		}
 
-		if len(resp.Chunk) == 0 {
-
-			return nil
-		}
-
-		err = c.client.MakeRequest(
+		err := c.client.MakeRequest(
 			"POST",
-			c.client.BuildURL("rooms", roomID, "receipt", "m.read", resp.Chunk[0].ID),
+			c.client.BuildURL("rooms", roomID, "receipt", "m.read", eventID),
 			struct{}{},
 			nil,
 		)
@@ -384,14 +401,3 @@ func (m *Message) ContainsMention(username string) bool {
 	return strings.Contains(body, mentionFormat)
 }
 
-func (m *Message) IsFromUser(userID string) bool {
-	return m.Sender == userID
-}
-
-func (m *Message) GetBody() string {
-	body, ok := m.Content["body"].(string)
-	if !ok {
-		return ""
-	}
-	return body
-}

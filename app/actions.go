@@ -99,7 +99,7 @@ func (a *Actions) FindRoomsToLeave(ctx context.Context, days int) ([]RoomToLeave
 	a.log.Debug("Fetching rooms to analyze")
 	a.reportProgress(0, 0, "Fetching room list...")
 
-	rooms, err := a.client.GetRooms(ctx)
+	rooms, err := a.client.GetRoomsViaSync(ctx)
 	if err != nil {
 		return nil, nil, helper.Wrap(err, "failed to fetch rooms")
 	}
@@ -192,7 +192,7 @@ func (a *Actions) LeaveRooms(ctx context.Context, roomsToLeave []RoomToLeave) (i
 			defer sem.Release(1)
 
 			room := roomInfo.Room
-			if err := a.client.LeaveRoom(ctx, room.ID); err != nil {
+			if err := a.client.LeaveRoom(ctx, room.ID, room.Name); err != nil {
 				a.log.WithError(err).WithFields(logrus.Fields{
 					"room_id":   room.ID,
 					"room_name": room.Name,
@@ -248,9 +248,9 @@ func (a *Actions) LeaveByDate(ctx context.Context, days int) (leftCount, remainC
 
 func (a *Actions) FindMentionedRooms(ctx context.Context, days int) ([]ActionRoom, error) {
 	a.log.Debug("Finding rooms with mentions")
-	a.reportProgress(0, 0, "Fetching room list...")
+	a.reportProgress(0, 0, "Fetching room list with timeline...")
 
-	rooms, err := a.client.GetRooms(ctx)
+	rooms, err := a.client.GetRoomsWithTimeline(ctx, 50)
 	if err != nil {
 		return nil, helper.Wrap(err, "failed to fetch rooms")
 	}
@@ -259,51 +259,96 @@ func (a *Actions) FindMentionedRooms(ctx context.Context, days int) ([]ActionRoo
 	a.reportProgress(0, total, "Checking mentions...")
 
 	limitTimestamp := helper.GetLimitTimestamp(days)
+	username := a.client.Config().Username
+	domain := a.client.Config().Domain
+
 	var mentionedRooms []ActionRoom
-	var mu sync.Mutex
 	var processed atomic.Int32
 
-	g, ctx := errgroup.WithContext(ctx)
-	sem := semaphore.NewWeighted(int64(a.maxConcurrency))
+	// Rooms that need a fallback API call (timeline was limited and no mention found in sync data)
+	var fallbackRooms []helper.RoomWithTimeline
 
+	// Phase 1: Check mentions from sync timeline data (no API calls)
 	for _, room := range rooms {
-		room := room
-		g.Go(func() error {
+		if room.LastActivity > 0 && room.LastActivity < limitTimestamp {
+			cur := int(processed.Add(1))
+			a.reportProgress(cur, total, "Checking mentions")
+			continue
+		}
 
-			if err := sem.Acquire(ctx, 1); err != nil {
-				return helper.Wrap(err, "failed to acquire semaphore")
+		found := false
+		for i := range room.TimelineEvents {
+			if room.TimelineEvents[i].Timestamp >= limitTimestamp &&
+				room.TimelineEvents[i].ContainsMention(username) {
+				found = true
+				break
 			}
-			defer sem.Release(1)
+		}
 
-			mentioned, err := a.checkRoomMentions(ctx, room.ID, limitTimestamp)
-			if err != nil {
-				a.log.WithError(err).WithField("room_id", room.ID).Warn("Failed to check mentions")
+		if found {
+			mentionedRooms = append(mentionedRooms, ActionRoom{
+				ID:          room.ID,
+				Name:        room.Name,
+				WebLink:     fmt.Sprintf("https://%s/#/room/%s", domain, room.ID),
+				ElementLink: fmt.Sprintf("element://vector/webapp/#/room/%s", room.ID),
+			})
+			cur := int(processed.Add(1))
+			a.reportProgress(cur, total, "Checking mentions")
+			continue
+		}
+
+		if room.TimelineLimited {
+			fallbackRooms = append(fallbackRooms, room)
+		} else {
+			cur := int(processed.Add(1))
+			a.reportProgress(cur, total, "Checking mentions")
+		}
+	}
+
+	// Phase 2: Fallback API calls only for rooms where timeline was limited
+	if len(fallbackRooms) > 0 {
+		a.log.Debugf("Falling back to API calls for %d rooms with limited timelines", len(fallbackRooms))
+
+		var mu sync.Mutex
+		g, gctx := errgroup.WithContext(ctx)
+		sem := semaphore.NewWeighted(int64(a.maxConcurrency))
+
+		for _, room := range fallbackRooms {
+			room := room
+			g.Go(func() error {
+				if err := sem.Acquire(gctx, 1); err != nil {
+					return helper.Wrap(err, "failed to acquire semaphore")
+				}
+				defer sem.Release(1)
+
+				mentioned, err := a.checkRoomMentions(gctx, room.ID, limitTimestamp)
+				if err != nil {
+					a.log.WithError(err).WithField("room_id", room.ID).Warn("Failed to check mentions")
+					cur := int(processed.Add(1))
+					a.reportProgress(cur, total, "Checking mentions")
+					return nil
+				}
+
+				if mentioned {
+					mu.Lock()
+					mentionedRooms = append(mentionedRooms, ActionRoom{
+						ID:          room.ID,
+						Name:        room.Name,
+						WebLink:     fmt.Sprintf("https://%s/#/room/%s", domain, room.ID),
+						ElementLink: fmt.Sprintf("element://vector/webapp/#/room/%s", room.ID),
+					})
+					mu.Unlock()
+				}
 
 				cur := int(processed.Add(1))
 				a.reportProgress(cur, total, "Checking mentions")
 				return nil
-			}
+			})
+		}
 
-			if mentioned {
-				mu.Lock()
-				domain := a.client.Config().Domain
-				mentionedRooms = append(mentionedRooms, ActionRoom{
-					ID:          room.ID,
-					Name:        room.Name,
-					WebLink:     fmt.Sprintf("https://%s/#/room/%s", domain, room.ID),
-					ElementLink: fmt.Sprintf("element://vector/webapp/#/room/%s", room.ID),
-				})
-				mu.Unlock()
-			}
-
-			cur := int(processed.Add(1))
-			a.reportProgress(cur, total, "Checking mentions")
-			return nil
-		})
-	}
-
-	if err := g.Wait(); err != nil {
-		return mentionedRooms, helper.Wrap(err, "error while checking mentions")
+		if err := g.Wait(); err != nil {
+			return mentionedRooms, helper.Wrap(err, "error while checking mentions")
+		}
 	}
 
 	return mentionedRooms, nil
@@ -313,7 +358,7 @@ func (a *Actions) MarkAllRoomsAsRead(ctx context.Context) error {
 	a.log.Debug("Starting to mark all rooms as read")
 	a.reportProgress(0, 0, "Fetching room list...")
 
-	rooms, err := a.client.GetRooms(ctx)
+	rooms, err := a.client.GetRoomsViaSync(ctx)
 	if err != nil {
 		return helper.Wrap(err, "failed to fetch rooms")
 	}
@@ -335,7 +380,7 @@ func (a *Actions) MarkAllRoomsAsRead(ctx context.Context) error {
 			}
 			defer sem.Release(1)
 
-			if err := a.client.MarkRoomAsRead(ctx, room.ID); err != nil {
+			if err := a.client.MarkRoomAsRead(ctx, room.ID, room.Name, room.LastEventID); err != nil {
 				a.log.WithError(err).WithField("room_id", room.ID).Error("Failed to mark room as read")
 				return helper.Wrap(err, fmt.Sprintf("failed to mark room %s as read", room.ID))
 			}
@@ -370,26 +415,31 @@ func (a *Actions) evaluateRoom(ctx context.Context, room helper.Room, limitTimes
 		return true, "Room name contains a closing keyword", nil
 	}
 
-	lastActivity, err := a.client.GetLastMessageTimestamp(ctx, room.ID)
-	if err != nil {
+	var lastActivity int64
+	if room.LastActivity > 0 {
+		lastActivity = room.LastActivity
+	} else {
+		var err error
+		lastActivity, err = a.client.GetLastMessageTimestamp(ctx, room.ID)
+		if err != nil {
+			if strings.Contains(err.Error(), "no messages") ||
+				strings.Contains(err.Error(), "empty room") {
+				a.log.WithFields(logrus.Fields{
+					"room_id":   room.ID,
+					"room_name": room.Name,
+				}).Debug("Room has no messages, treating as inactive")
 
-		if strings.Contains(err.Error(), "no messages") ||
-			strings.Contains(err.Error(), "empty room") {
-			a.log.WithFields(logrus.Fields{
+				reason := "Room has no messages and name contains closing keyword"
+				return true, reason, nil
+			}
+
+			a.log.WithError(err).WithFields(logrus.Fields{
 				"room_id":   room.ID,
 				"room_name": room.Name,
-			}).Debug("Room has no messages, treating as inactive")
+			}).Error("Failed to get last message timestamp")
 
-			reason := "Room has no messages and name contains closing keyword"
-			return true, reason, nil
+			return false, "", helper.Wrap(err, "failed to get last message timestamp")
 		}
-
-		a.log.WithError(err).WithFields(logrus.Fields{
-			"room_id":   room.ID,
-			"room_name": room.Name,
-		}).Error("Failed to get last message timestamp")
-
-		return false, "", helper.Wrap(err, "failed to get last message timestamp")
 	}
 
 	if lastActivity < limitTimestamp {
@@ -405,7 +455,7 @@ func (a *Actions) FindInactiveRoomsToLeave(ctx context.Context, days int) ([]Roo
 	a.log.Debug("Fetching rooms to analyze for inactivity")
 	a.reportProgress(0, 0, "Fetching room list...")
 
-	rooms, err := a.client.GetRooms(ctx)
+	rooms, err := a.client.GetRoomsViaSync(ctx)
 	if err != nil {
 		return nil, nil, helper.Wrap(err, "failed to fetch rooms")
 	}
@@ -470,13 +520,19 @@ func (a *Actions) FindInactiveRoomsToLeave(ctx context.Context, days int) ([]Roo
 }
 
 func (a *Actions) evaluateRoomForInactiveLeave(ctx context.Context, room helper.Room, limitTimestamp int64) (bool, string, error) {
-	lastActivity, err := a.client.GetLastMessageTimestamp(ctx, room.ID)
-	if err != nil {
-		if strings.Contains(err.Error(), "no messages") ||
-			strings.Contains(err.Error(), "empty room") {
-			return true, "Room has no messages", nil
+	var lastActivity int64
+	if room.LastActivity > 0 {
+		lastActivity = room.LastActivity
+	} else {
+		var err error
+		lastActivity, err = a.client.GetLastMessageTimestamp(ctx, room.ID)
+		if err != nil {
+			if strings.Contains(err.Error(), "no messages") ||
+				strings.Contains(err.Error(), "empty room") {
+				return true, "Room has no messages", nil
+			}
+			return false, "", helper.Wrap(err, "failed to get last message timestamp")
 		}
-		return false, "", helper.Wrap(err, "failed to get last message timestamp")
 	}
 
 	if lastActivity < limitTimestamp {

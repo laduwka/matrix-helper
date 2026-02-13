@@ -150,5 +150,7 @@ MIT License
 - [gomatrix](https://github.com/matrix-org/gomatrix) - Matrix клиент для Go
 - [cenkalti/backoff](https://github.com/cenkalti/backoff) - Retry с exponential backoff
 - [sony/gobreaker](https://github.com/sony/gobreaker) - Circuit breaker
+- [golang.org/x/time/rate](https://pkg.go.dev/golang.org/x/time/rate) - Rate limiter
+- [golang.org/x/sync](https://pkg.go.dev/golang.org/x/sync) - Примитивы конкурентности (errgroup, semaphore)
 - [logrus](https://github.com/sirupsen/logrus) - Логирование
 - [fatih/color](https://github.com/fatih/color) - Цветной вывод в терминале

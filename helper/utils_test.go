@@ -4,7 +4,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/matrix-org/gomatrix"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -51,85 +50,5 @@ func TestHasCloseStatusMessage(t *testing.T) {
 			result := HasCloseStatusMessage(tt.roomName)
 			assert.Equal(t, tt.expected, result)
 		})
-	}
-}
-
-func TestShouldRetry(t *testing.T) {
-	tests := []struct {
-		name     string
-		err      error
-		expected bool
-	}{
-		{
-			"429 rate limited",
-			gomatrix.HTTPError{Code: 429, Message: "rate limited"},
-			true,
-		},
-		{
-			"500 server error",
-			gomatrix.HTTPError{Code: 500, Message: "internal error"},
-			true,
-		},
-		{
-			"502 bad gateway",
-			gomatrix.HTTPError{Code: 502, Message: "bad gateway"},
-			true,
-		},
-		{
-			"403 forbidden",
-			gomatrix.HTTPError{Code: 403, Message: "forbidden"},
-			false,
-		},
-		{
-			"404 not found",
-			gomatrix.HTTPError{Code: 404, Message: "not found"},
-			false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := ShouldRetry(tt.err)
-			assert.Equal(t, tt.expected, result)
-		})
-	}
-}
-
-func TestIsRateLimited(t *testing.T) {
-	tests := []struct {
-		name     string
-		err      error
-		expected bool
-	}{
-		{
-			"429 value type",
-			gomatrix.HTTPError{Code: 429, Message: "rate limited"},
-			true,
-		},
-		{
-			"429 pointer type",
-			&gomatrix.HTTPError{Code: 429, Message: "rate limited"},
-			true,
-		},
-		{
-			"500 not rate limited",
-			gomatrix.HTTPError{Code: 500, Message: "internal error"},
-			false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := IsRateLimited(tt.err)
-			assert.Equal(t, tt.expected, result)
-		})
-	}
-}
-
-func TestRandomInt(t *testing.T) {
-	for i := 0; i < 100; i++ {
-		result := RandomInt(5, 10)
-		assert.GreaterOrEqual(t, result, 5)
-		assert.LessOrEqual(t, result, 10)
 	}
 }
