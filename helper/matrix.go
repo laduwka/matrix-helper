@@ -431,13 +431,8 @@ func (c *matrixClient) LeaveRoom(ctx context.Context, roomID, roomName string) e
 			}).Debug("Failed to leave room")
 			return Wrap(err, "failed to leave room")
 		}
-
-		c.log.WithFields(logrus.Fields{
-			"room_name": roomName,
-		}).Info("Successfully left room")
-
 		return nil
-	}, WithoutRateLimit())
+	})
 
 	return err
 }

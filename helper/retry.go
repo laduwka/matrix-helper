@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync/atomic"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
@@ -78,28 +79,41 @@ func WithoutRateLimit() DoOption {
 
 // smartBackOff wraps an ExponentialBackOff and overrides the delay
 // when a 429 response includes retry_after_ms.
+// Rate-limit retries (429) do not count toward maxRetries, allowing
+// the operation to keep retrying as long as the server asks to wait.
+// A separate maxRateLimitRetries cap prevents infinite loops.
 type smartBackOff struct {
-	inner   backoff.BackOff
-	lastErr *error
+	inner              backoff.BackOff
+	lastErr            *error
+	maxRetries         uint64
+	numRetries         uint64
+	maxRateLimitRetries uint64
+	numRateLimitRetries uint64
 }
 
 func (s *smartBackOff) NextBackOff() time.Duration {
-	base := s.inner.NextBackOff()
-	if base == backoff.Stop {
-		return backoff.Stop
-	}
-
 	if s.lastErr != nil && *s.lastErr != nil {
 		if delay := extractRetryAfter(*s.lastErr); delay > 0 {
+			s.numRateLimitRetries++
+			if s.maxRateLimitRetries > 0 && s.numRateLimitRetries > s.maxRateLimitRetries {
+				return backoff.Stop
+			}
 			return delay
 		}
 	}
 
-	return base
+	s.numRetries++
+	if s.numRetries > s.maxRetries {
+		return backoff.Stop
+	}
+
+	return s.inner.NextBackOff()
 }
 
 func (s *smartBackOff) Reset() {
 	s.inner.Reset()
+	s.numRetries = 0
+	s.numRateLimitRetries = 0
 }
 
 // extractRetryAfter parses retry_after_ms from a 429 HTTP error response.
@@ -116,10 +130,46 @@ func extractRetryAfter(err error) time.Duration {
 }
 
 // Retry combines retry with exponential backoff, circuit breaker, and rate limiting.
+// The pausedUntil field provides cross-goroutine coordination: when any goroutine
+// receives a 429, all goroutines pause until the server-specified deadline.
 type Retry struct {
 	retryOpts   RetryOptions
 	cb          *gobreaker.CircuitBreaker[struct{}]
 	rateLimiter *rate.Limiter
+	pausedUntil atomic.Int64 // unix nanoseconds; 0 = not paused
+}
+
+// setPause records a server-requested pause. If the new deadline is later
+// than the current one, it wins (concurrent 429s → longest pause prevails).
+func (r *Retry) setPause(d time.Duration) {
+	deadline := time.Now().Add(d).UnixNano()
+	for {
+		current := r.pausedUntil.Load()
+		if deadline <= current {
+			return
+		}
+		if r.pausedUntil.CompareAndSwap(current, deadline) {
+			return
+		}
+	}
+}
+
+// waitForPause blocks until the shared pause expires or the context is cancelled.
+func (r *Retry) waitForPause(ctx context.Context) error {
+	deadline := r.pausedUntil.Load()
+	if deadline == 0 {
+		return nil
+	}
+	remaining := time.Until(time.Unix(0, deadline))
+	if remaining <= 0 {
+		return nil
+	}
+	select {
+	case <-time.After(remaining):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func NewRetry(retryOpts RetryOptions, cbOpts CircuitBreakerOptions, rlOpts RateLimiterOptions) *Retry {
@@ -186,25 +236,44 @@ func (r *Retry) Do(ctx context.Context, operation func() error, opts ...DoOption
 		eb.RandomizationFactor = 0
 	}
 
-	smart := &smartBackOff{inner: eb, lastErr: &lastErr}
-	maxRetries := backoff.WithMaxRetries(smart, uint64(r.retryOpts.MaxAttempts-1))
-	bCtx := backoff.WithContext(maxRetries, ctx)
+	smart := &smartBackOff{
+		inner:               eb,
+		lastErr:             &lastErr,
+		maxRetries:          uint64(r.retryOpts.MaxAttempts - 1),
+		maxRateLimitRetries: 10,
+	}
+	bCtx := backoff.WithContext(smart, ctx)
 
 	wrappedOp := func() error {
+		// Wait for any shared pause set by another goroutine's 429.
+		if err := r.waitForPause(ctx); err != nil {
+			return backoff.Permanent(err)
+		}
+
+		var err error
 		if r.cb != nil {
-			_, err := r.cb.Execute(func() (struct{}, error) {
+			_, err = r.cb.Execute(func() (struct{}, error) {
 				return struct{}{}, operation()
 			})
-			lastErr = err
 			if err != nil {
 				if errors.Is(err, gobreaker.ErrOpenState) || errors.Is(err, gobreaker.ErrTooManyRequests) {
+					lastErr = err
 					return backoff.Permanent(err)
 				}
 			}
-			return err
+		} else {
+			err = operation()
 		}
-		err := operation()
+
 		lastErr = err
+
+		// If this was a 429, pause ALL goroutines for the server-specified duration.
+		if err != nil {
+			if delay := extractRetryAfter(err); delay > 0 {
+				r.setPause(delay)
+			}
+		}
+
 		return err
 	}
 
