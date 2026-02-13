@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/matrix-org/gomatrix"
@@ -19,34 +18,26 @@ type Config struct {
 	DeviceID      string
 }
 
-type Message struct {
-	ID        string
-	Sender    string
-	Content   map[string]interface{}
-	Type      string
-	Timestamp int64
-}
-
 type Room struct {
-	ID           string
-	Name         string
-	Topic        string
-	LastActivity int64
-	LastEventID  string
+	ID                string
+	Name              string
+	Topic             string
+	LastActivity      int64
+	LastEventID       string
+	NotificationCount int
 }
 
-type RoomWithTimeline struct {
-	Room
-	TimelineEvents  []Message
-	TimelineLimited bool
+type Notification struct {
+	RoomID string
+	Event  gomatrix.Event
+	TS     int64
 }
 
 type Client interface {
 	GetRoomsViaSync(ctx context.Context) ([]Room, error)
-	GetRoomsWithTimeline(ctx context.Context, timelineLimit int) ([]RoomWithTimeline, error)
+	GetNotifications(ctx context.Context, since int64) ([]Notification, error)
 	LeaveRoom(ctx context.Context, roomID, roomName string) error
 
-	GetMessages(ctx context.Context, roomID string, since int64) ([]Message, error)
 	GetLastMessageTimestamp(ctx context.Context, roomID string) (int64, error)
 	MarkRoomAsRead(ctx context.Context, roomID, roomName, lastEventID string) error
 
@@ -250,15 +241,38 @@ func LogoutAndCleanup(token *CachedToken) error {
 
 const syncFilter = `{"presence":{"types":[]},"account_data":{"types":[]},"room":{"state":{"types":["m.room.name","m.room.topic"]},"timeline":{"limit":1},"ephemeral":{"types":[]},"account_data":{"types":[]}}}`
 
+// syncResponse is a custom sync response struct that captures unread_notifications
+// which gomatrix's RespSync does not support.
+type syncResponse struct {
+	Rooms struct {
+		Join map[string]syncJoinedRoom `json:"join"`
+	} `json:"rooms"`
+}
+
+type syncJoinedRoom struct {
+	State struct {
+		Events []gomatrix.Event `json:"events"`
+	} `json:"state"`
+	Timeline struct {
+		Events []gomatrix.Event `json:"events"`
+	} `json:"timeline"`
+	UnreadNotifications struct {
+		NotificationCount int `json:"notification_count"`
+		HighlightCount    int `json:"highlight_count"`
+	} `json:"unread_notifications"`
+}
+
 func (c *matrixClient) GetRoomsViaSync(ctx context.Context) ([]Room, error) {
-	var resp *gomatrix.RespSync
+	var resp syncResponse
 	err := c.retry.Do(ctx, func() error {
-		var err error
-		resp, err = c.client.SyncRequest(0, "", syncFilter, true, "offline")
-		if err != nil {
-			return Wrap(err, "failed to sync")
+		query := map[string]string{
+			"timeout":      "0",
+			"filter":       syncFilter,
+			"full_state":   "true",
+			"set_presence": "offline",
 		}
-		return nil
+		urlPath := c.client.BuildURLWithQuery([]string{"sync"}, query)
+		return c.client.MakeRequest("GET", urlPath, nil, &resp)
 	})
 	if err != nil {
 		return nil, Wrap(err, "failed to sync after retries")
@@ -287,110 +301,68 @@ func (c *matrixClient) GetRoomsViaSync(ctx context.Context) ([]Room, error) {
 			room.LastEventID = last.ID
 		}
 
+		room.NotificationCount = joinedRoom.UnreadNotifications.NotificationCount
 		rooms = append(rooms, room)
 	}
 
 	return rooms, nil
 }
 
-func (c *matrixClient) GetRoomsWithTimeline(ctx context.Context, timelineLimit int) ([]RoomWithTimeline, error) {
-	filter := fmt.Sprintf(
-		`{"presence":{"types":[]},"account_data":{"types":[]},"room":{"state":{"types":["m.room.name","m.room.topic"]},"timeline":{"limit":%d},"ephemeral":{"types":[]},"account_data":{"types":[]}}}`,
-		timelineLimit,
-	)
-
-	var resp *gomatrix.RespSync
-	err := c.retry.Do(ctx, func() error {
-		var err error
-		resp, err = c.client.SyncRequest(0, "", filter, true, "offline")
-		if err != nil {
-			return Wrap(err, "failed to sync")
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, Wrap(err, "failed to sync after retries")
-	}
-
-	rooms := make([]RoomWithTimeline, 0, len(resp.Rooms.Join))
-	for roomID, joinedRoom := range resp.Rooms.Join {
-		room := RoomWithTimeline{
-			Room:            Room{ID: roomID, Name: roomID},
-			TimelineLimited: joinedRoom.Timeline.Limited,
-		}
-
-		for _, ev := range joinedRoom.State.Events {
-			switch ev.Type {
-			case "m.room.name":
-				if name, ok := ev.Content["name"].(string); ok && name != "" {
-					room.Name = name
-				}
-			case "m.room.topic":
-				if topic, ok := ev.Content["topic"].(string); ok {
-					room.Topic = topic
-				}
-			}
-		}
-
-		if len(joinedRoom.Timeline.Events) > 0 {
-			last := joinedRoom.Timeline.Events[len(joinedRoom.Timeline.Events)-1]
-			room.LastActivity = last.Timestamp
-			room.LastEventID = last.ID
-		}
-
-		for _, ev := range joinedRoom.Timeline.Events {
-			if ev.Type == "m.room.message" {
-				room.TimelineEvents = append(room.TimelineEvents, Message{
-					ID:        ev.ID,
-					Sender:    ev.Sender,
-					Content:   ev.Content,
-					Type:      ev.Type,
-					Timestamp: ev.Timestamp,
-				})
-			}
-		}
-
-		rooms = append(rooms, room)
-	}
-
-	return rooms, nil
+type notificationsResponse struct {
+	Notifications []struct {
+		Event  gomatrix.Event `json:"event"`
+		RoomID string         `json:"room_id"`
+		TS     int64          `json:"ts"`
+	} `json:"notifications"`
+	NextToken string `json:"next_token"`
 }
 
-func (c *matrixClient) GetMessages(ctx context.Context, roomID string, since int64) ([]Message, error) {
-	var messages []Message
+func (c *matrixClient) GetNotifications(ctx context.Context, since int64) ([]Notification, error) {
+	var all []Notification
+	from := ""
 
-	err := c.retry.Do(ctx, func() error {
-
-		resp, err := c.client.Messages(roomID, "", "", 'b', 100)
+	for {
+		var resp notificationsResponse
+		currentFrom := from
+		err := c.retry.Do(ctx, func() error {
+			query := map[string]string{
+				"limit": "100",
+				"only":  "highlight",
+			}
+			if currentFrom != "" {
+				query["from"] = currentFrom
+			}
+			urlPath := c.client.BuildURLWithQuery([]string{"notifications"}, query)
+			return c.client.MakeRequest("GET", urlPath, nil, &resp)
+		})
 		if err != nil {
-			return Wrap(err, "failed to get messages")
+			return all, Wrap(err, "failed to get notifications")
 		}
 
-		messages = make([]Message, 0, len(resp.Chunk))
-		for _, event := range resp.Chunk {
-
-			if event.Timestamp < since {
-				continue
-			}
-
-			if event.Type == "m.room.message" {
-				messages = append(messages, Message{
-					ID:        event.ID,
-					Sender:    event.Sender,
-					Content:   event.Content,
-					Type:      event.Type,
-					Timestamp: event.Timestamp,
-				})
-			}
+		if len(resp.Notifications) == 0 {
+			break
 		}
-		return nil
-	})
 
-	if err != nil {
-		return nil, Wrap(err, "failed to get messages after retries")
+		reachedEnd := false
+		for _, n := range resp.Notifications {
+			if n.TS < since {
+				reachedEnd = true
+				break
+			}
+			all = append(all, Notification{
+				RoomID: n.RoomID,
+				Event:  n.Event,
+				TS:     n.TS,
+			})
+		}
+
+		if reachedEnd || resp.NextToken == "" {
+			break
+		}
+		from = resp.NextToken
 	}
 
-	return messages, nil
+	return all, nil
 }
 
 func (c *matrixClient) GetLastMessageTimestamp(ctx context.Context, roomID string) (int64, error) {
@@ -479,11 +451,3 @@ func (c *matrixClient) MarkRoomAsRead(ctx context.Context, roomID, roomName, las
 	return err
 }
 
-func (m *Message) ContainsMention(username string) bool {
-	body, ok := m.Content["body"].(string)
-	if !ok {
-		return false
-	}
-	mentionFormat := fmt.Sprintf("@%s:", username)
-	return strings.Contains(body, mentionFormat)
-}

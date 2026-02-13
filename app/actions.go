@@ -248,107 +248,47 @@ func (a *Actions) LeaveByDate(ctx context.Context, days int) (leftCount, remainC
 
 func (a *Actions) FindMentionedRooms(ctx context.Context, days int) ([]ActionRoom, error) {
 	a.log.Debug("Finding rooms with mentions")
-	a.reportProgress(0, 0, "Fetching room list with timeline...")
+	a.reportProgress(0, 0, "Fetching room list...")
 
-	rooms, err := a.client.GetRoomsWithTimeline(ctx, 50)
+	rooms, err := a.client.GetRoomsViaSync(ctx)
 	if err != nil {
 		return nil, helper.Wrap(err, "failed to fetch rooms")
 	}
 
-	total := len(rooms)
-	a.reportProgress(0, total, "Checking mentions...")
-
-	limitTimestamp := helper.GetLimitTimestamp(days)
-	username := a.client.Config().Username
-	domain := a.client.Config().Domain
-
-	var mentionedRooms []ActionRoom
-	var processed atomic.Int32
-
-	// Rooms that need a fallback API call (timeline was limited and no mention found in sync data)
-	var fallbackRooms []helper.RoomWithTimeline
-
-	// Phase 1: Check mentions from sync timeline data (no API calls)
-	for _, room := range rooms {
-		if room.LastActivity > 0 && room.LastActivity < limitTimestamp {
-			cur := int(processed.Add(1))
-			a.reportProgress(cur, total, "Checking mentions")
-			continue
-		}
-
-		found := false
-		for i := range room.TimelineEvents {
-			if room.TimelineEvents[i].Timestamp >= limitTimestamp &&
-				room.TimelineEvents[i].ContainsMention(username) {
-				found = true
-				break
-			}
-		}
-
-		if found {
-			mentionedRooms = append(mentionedRooms, ActionRoom{
-				ID:          room.ID,
-				Name:        room.Name,
-				WebLink:     fmt.Sprintf("https://%s/#/room/%s", domain, room.ID),
-				ElementLink: fmt.Sprintf("element://vector/webapp/#/room/%s", room.ID),
-			})
-			cur := int(processed.Add(1))
-			a.reportProgress(cur, total, "Checking mentions")
-			continue
-		}
-
-		if room.TimelineLimited {
-			fallbackRooms = append(fallbackRooms, room)
-		} else {
-			cur := int(processed.Add(1))
-			a.reportProgress(cur, total, "Checking mentions")
-		}
+	roomNames := make(map[string]string, len(rooms))
+	for _, r := range rooms {
+		roomNames[r.ID] = r.Name
 	}
 
-	// Phase 2: Fallback API calls only for rooms where timeline was limited
-	if len(fallbackRooms) > 0 {
-		a.log.Debugf("Falling back to API calls for %d rooms with limited timelines", len(fallbackRooms))
+	a.reportProgress(0, 0, "Fetching notifications...")
 
-		var mu sync.Mutex
-		g, gctx := errgroup.WithContext(ctx)
-		sem := semaphore.NewWeighted(int64(a.maxConcurrency))
+	limitTimestamp := helper.GetLimitTimestamp(days)
+	notifications, err := a.client.GetNotifications(ctx, limitTimestamp)
+	if err != nil {
+		return nil, helper.Wrap(err, "failed to fetch notifications")
+	}
 
-		for _, room := range fallbackRooms {
-			room := room
-			g.Go(func() error {
-				if err := sem.Acquire(gctx, 1); err != nil {
-					return helper.Wrap(err, "failed to acquire semaphore")
-				}
-				defer sem.Release(1)
+	domain := a.client.Config().Domain
+	seen := make(map[string]bool)
+	var mentionedRooms []ActionRoom
 
-				mentioned, err := a.checkRoomMentions(gctx, room.ID, limitTimestamp)
-				if err != nil {
-					a.log.WithError(err).WithField("room_id", room.ID).Warn("Failed to check mentions")
-					cur := int(processed.Add(1))
-					a.reportProgress(cur, total, "Checking mentions")
-					return nil
-				}
+	for _, n := range notifications {
+		if seen[n.RoomID] {
+			continue
+		}
+		seen[n.RoomID] = true
 
-				if mentioned {
-					mu.Lock()
-					mentionedRooms = append(mentionedRooms, ActionRoom{
-						ID:          room.ID,
-						Name:        room.Name,
-						WebLink:     fmt.Sprintf("https://%s/#/room/%s", domain, room.ID),
-						ElementLink: fmt.Sprintf("element://vector/webapp/#/room/%s", room.ID),
-					})
-					mu.Unlock()
-				}
-
-				cur := int(processed.Add(1))
-				a.reportProgress(cur, total, "Checking mentions")
-				return nil
-			})
+		name := roomNames[n.RoomID]
+		if name == "" {
+			name = n.RoomID
 		}
 
-		if err := g.Wait(); err != nil {
-			return mentionedRooms, helper.Wrap(err, "error while checking mentions")
-		}
+		mentionedRooms = append(mentionedRooms, ActionRoom{
+			ID:          n.RoomID,
+			Name:        name,
+			WebLink:     fmt.Sprintf("https://%s/#/room/%s", domain, n.RoomID),
+			ElementLink: fmt.Sprintf("element://vector/webapp/#/room/%s", n.RoomID),
+		})
 	}
 
 	return mentionedRooms, nil
@@ -363,7 +303,20 @@ func (a *Actions) MarkAllRoomsAsRead(ctx context.Context) error {
 		return helper.Wrap(err, "failed to fetch rooms")
 	}
 
-	total := len(rooms)
+	var unreadRooms []helper.Room
+	for _, room := range rooms {
+		if room.NotificationCount > 0 {
+			unreadRooms = append(unreadRooms, room)
+		}
+	}
+
+	a.log.Debugf("Found %d unread rooms out of %d total", len(unreadRooms), len(rooms))
+
+	if len(unreadRooms) == 0 {
+		return nil
+	}
+
+	total := len(unreadRooms)
 	a.reportProgress(0, total, "Marking rooms as read...")
 
 	var processed atomic.Int32
@@ -371,7 +324,7 @@ func (a *Actions) MarkAllRoomsAsRead(ctx context.Context) error {
 	g, ctx := errgroup.WithContext(ctx)
 	sem := semaphore.NewWeighted(int64(a.maxConcurrency))
 
-	for _, room := range rooms {
+	for _, room := range unreadRooms {
 		room := room
 		g.Go(func() error {
 
@@ -396,7 +349,6 @@ func (a *Actions) MarkAllRoomsAsRead(ctx context.Context) error {
 		return helper.Wrap(err, "failed to mark all rooms as read")
 	}
 
-	a.log.Info("Successfully marked all rooms as read")
 	return nil
 }
 
@@ -544,17 +496,3 @@ func (a *Actions) evaluateRoomForInactiveLeave(ctx context.Context, room helper.
 	return false, "", nil
 }
 
-func (a *Actions) checkRoomMentions(ctx context.Context, roomID string, since int64) (bool, error) {
-	messages, err := a.client.GetMessages(ctx, roomID, since)
-	if err != nil {
-		return false, helper.Wrap(err, "failed to get messages")
-	}
-
-	for _, msg := range messages {
-		if msg.ContainsMention(a.client.Config().Username) {
-			return true, nil
-		}
-	}
-
-	return false, nil
-}

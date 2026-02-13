@@ -14,24 +14,22 @@ import (
 
 // mockClient implements helper.Client for testing
 type mockClient struct {
-	rooms             []helper.Room
-	roomsWithTimeline []helper.RoomWithTimeline
-	getRoomsErr       error
-	leaveRoomErr      error
-	leaveRoomCalls    []string
-	messages          map[string][]helper.Message
-	getMessagesErr    error
-	lastTimestamp     map[string]int64
-	lastTimestampErr  map[string]error
-	markAsReadErr     error
-	markAsReadCalls   []string
-	config            helper.Config
-	userID            string
+	rooms              []helper.Room
+	getRoomsErr        error
+	leaveRoomErr       error
+	leaveRoomCalls     []string
+	notifications      []helper.Notification
+	getNotificationsErr error
+	lastTimestamp      map[string]int64
+	lastTimestampErr   map[string]error
+	markAsReadErr      error
+	markAsReadCalls    []string
+	config             helper.Config
+	userID             string
 }
 
 func newMockClient() *mockClient {
 	return &mockClient{
-		messages:         make(map[string][]helper.Message),
 		lastTimestamp:    make(map[string]int64),
 		lastTimestampErr: make(map[string]error),
 		config: helper.Config{
@@ -49,30 +47,16 @@ func (m *mockClient) GetRoomsViaSync(_ context.Context) ([]helper.Room, error) {
 	return m.rooms, nil
 }
 
-func (m *mockClient) GetRoomsWithTimeline(_ context.Context, _ int) ([]helper.RoomWithTimeline, error) {
-	if m.getRoomsErr != nil {
-		return nil, m.getRoomsErr
+func (m *mockClient) GetNotifications(_ context.Context, _ int64) ([]helper.Notification, error) {
+	if m.getNotificationsErr != nil {
+		return nil, m.getNotificationsErr
 	}
-	if m.roomsWithTimeline != nil {
-		return m.roomsWithTimeline, nil
-	}
-	result := make([]helper.RoomWithTimeline, len(m.rooms))
-	for i, r := range m.rooms {
-		result[i] = helper.RoomWithTimeline{Room: r}
-	}
-	return result, nil
+	return m.notifications, nil
 }
 
 func (m *mockClient) LeaveRoom(_ context.Context, roomID, _ string) error {
 	m.leaveRoomCalls = append(m.leaveRoomCalls, roomID)
 	return m.leaveRoomErr
-}
-
-func (m *mockClient) GetMessages(_ context.Context, roomID string, _ int64) ([]helper.Message, error) {
-	if m.getMessagesErr != nil {
-		return nil, m.getMessagesErr
-	}
-	return m.messages[roomID], nil
 }
 
 func (m *mockClient) GetLastMessageTimestamp(_ context.Context, roomID string) (int64, error) {
@@ -239,18 +223,11 @@ func TestLeaveRooms_Empty(t *testing.T) {
 
 func TestFindMentionedRooms_Found(t *testing.T) {
 	mc := newMockClient()
-	mc.roomsWithTimeline = []helper.RoomWithTimeline{
-		{
-			Room: helper.Room{ID: "!room1:test", Name: "Dev channel", LastActivity: time.Now().UnixMilli()},
-			TimelineEvents: []helper.Message{
-				{
-					ID:        "msg1",
-					Sender:    "@other:test",
-					Content:   map[string]interface{}{"body": "Hey @testuser: check this"},
-					Timestamp: time.Now().Unix() * 1000,
-				},
-			},
-		},
+	mc.rooms = []helper.Room{
+		{ID: "!room1:test", Name: "Dev channel"},
+	}
+	mc.notifications = []helper.Notification{
+		{RoomID: "!room1:test", TS: time.Now().UnixMilli()},
 	}
 
 	actions := newTestActions(mc)
@@ -263,19 +240,10 @@ func TestFindMentionedRooms_Found(t *testing.T) {
 
 func TestFindMentionedRooms_NotFound(t *testing.T) {
 	mc := newMockClient()
-	mc.roomsWithTimeline = []helper.RoomWithTimeline{
-		{
-			Room: helper.Room{ID: "!room1:test", Name: "Dev channel", LastActivity: time.Now().UnixMilli()},
-			TimelineEvents: []helper.Message{
-				{
-					ID:        "msg1",
-					Sender:    "@other:test",
-					Content:   map[string]interface{}{"body": "Hello everyone"},
-					Timestamp: time.Now().Unix() * 1000,
-				},
-			},
-		},
+	mc.rooms = []helper.Room{
+		{ID: "!room1:test", Name: "Dev channel"},
 	}
+	mc.notifications = nil
 
 	actions := newTestActions(mc)
 	mentioned, err := actions.FindMentionedRooms(context.Background(), 30)
@@ -294,13 +262,60 @@ func TestFindMentionedRooms_GetRoomsError(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestFindMentionedRooms_GetNotificationsError(t *testing.T) {
+	mc := newMockClient()
+	mc.rooms = []helper.Room{
+		{ID: "!room1:test", Name: "Dev channel"},
+	}
+	mc.getNotificationsErr = errors.New("notifications API failed")
+
+	actions := newTestActions(mc)
+	_, err := actions.FindMentionedRooms(context.Background(), 30)
+
+	assert.Error(t, err)
+}
+
+func TestFindMentionedRooms_DeduplicatesRooms(t *testing.T) {
+	mc := newMockClient()
+	mc.rooms = []helper.Room{
+		{ID: "!room1:test", Name: "Dev channel"},
+	}
+	mc.notifications = []helper.Notification{
+		{RoomID: "!room1:test", TS: time.Now().UnixMilli()},
+		{RoomID: "!room1:test", TS: time.Now().Add(-time.Hour).UnixMilli()},
+		{RoomID: "!room1:test", TS: time.Now().Add(-2 * time.Hour).UnixMilli()},
+	}
+
+	actions := newTestActions(mc)
+	mentioned, err := actions.FindMentionedRooms(context.Background(), 30)
+	require.NoError(t, err)
+
+	assert.Len(t, mentioned, 1)
+	assert.Equal(t, "Dev channel", mentioned[0].Name)
+}
+
+func TestFindMentionedRooms_UnknownRoomUsesID(t *testing.T) {
+	mc := newMockClient()
+	mc.rooms = []helper.Room{}
+	mc.notifications = []helper.Notification{
+		{RoomID: "!unknown:test", TS: time.Now().UnixMilli()},
+	}
+
+	actions := newTestActions(mc)
+	mentioned, err := actions.FindMentionedRooms(context.Background(), 30)
+	require.NoError(t, err)
+
+	assert.Len(t, mentioned, 1)
+	assert.Equal(t, "!unknown:test", mentioned[0].Name)
+}
+
 // MarkAllRoomsAsRead tests
 
 func TestMarkAllRoomsAsRead_Success(t *testing.T) {
 	mc := newMockClient()
 	mc.rooms = []helper.Room{
-		{ID: "!room1:test", Name: "Room 1"},
-		{ID: "!room2:test", Name: "Room 2"},
+		{ID: "!room1:test", Name: "Room 1", NotificationCount: 3},
+		{ID: "!room2:test", Name: "Room 2", NotificationCount: 1},
 	}
 
 	actions := newTestActions(mc)
@@ -310,10 +325,40 @@ func TestMarkAllRoomsAsRead_Success(t *testing.T) {
 	assert.Len(t, mc.markAsReadCalls, 2)
 }
 
+func TestMarkAllRoomsAsRead_SkipsAlreadyReadRooms(t *testing.T) {
+	mc := newMockClient()
+	mc.rooms = []helper.Room{
+		{ID: "!room1:test", Name: "Unread Room", NotificationCount: 5},
+		{ID: "!room2:test", Name: "Read Room", NotificationCount: 0},
+		{ID: "!room3:test", Name: "Another Read", NotificationCount: 0},
+	}
+
+	actions := newTestActions(mc)
+	err := actions.MarkAllRoomsAsRead(context.Background())
+	require.NoError(t, err)
+
+	assert.Len(t, mc.markAsReadCalls, 1)
+	assert.Equal(t, "!room1:test", mc.markAsReadCalls[0])
+}
+
+func TestMarkAllRoomsAsRead_AllAlreadyRead(t *testing.T) {
+	mc := newMockClient()
+	mc.rooms = []helper.Room{
+		{ID: "!room1:test", Name: "Room 1", NotificationCount: 0},
+		{ID: "!room2:test", Name: "Room 2", NotificationCount: 0},
+	}
+
+	actions := newTestActions(mc)
+	err := actions.MarkAllRoomsAsRead(context.Background())
+	require.NoError(t, err)
+
+	assert.Len(t, mc.markAsReadCalls, 0)
+}
+
 func TestMarkAllRoomsAsRead_Error(t *testing.T) {
 	mc := newMockClient()
 	mc.rooms = []helper.Room{
-		{ID: "!room1:test", Name: "Room 1"},
+		{ID: "!room1:test", Name: "Room 1", NotificationCount: 2},
 	}
 	mc.markAsReadErr = errors.New("failed to mark")
 
@@ -498,84 +543,3 @@ func TestFindRoomsToLeave_LastActivityActiveWithKeyword(t *testing.T) {
 	assert.Len(t, toKeep, 1)
 }
 
-// FindMentionedRooms optimization tests
-
-func TestFindMentionedRooms_FallbackToAPI(t *testing.T) {
-	mc := newMockClient()
-	mc.roomsWithTimeline = []helper.RoomWithTimeline{
-		{
-			Room:            helper.Room{ID: "!room1:test", Name: "Active room", LastActivity: time.Now().UnixMilli()},
-			TimelineEvents:  []helper.Message{},
-			TimelineLimited: true,
-		},
-	}
-	mc.messages["!room1:test"] = []helper.Message{
-		{
-			ID:        "msg-old",
-			Sender:    "@other:test",
-			Content:   map[string]interface{}{"body": "Hey @testuser: look at this"},
-			Timestamp: time.Now().Unix() * 1000,
-		},
-	}
-
-	actions := newTestActions(mc)
-	mentioned, err := actions.FindMentionedRooms(context.Background(), 30)
-	require.NoError(t, err)
-
-	assert.Len(t, mentioned, 1)
-	assert.Equal(t, "Active room", mentioned[0].Name)
-}
-
-func TestFindMentionedRooms_SkipsInactiveRooms(t *testing.T) {
-	mc := newMockClient()
-	mc.roomsWithTimeline = []helper.RoomWithTimeline{
-		{
-			Room: helper.Room{
-				ID:           "!room1:test",
-				Name:         "Old room",
-				LastActivity: time.Now().AddDate(0, 0, -60).UnixMilli(),
-			},
-			TimelineEvents: []helper.Message{
-				{
-					ID:        "msg1",
-					Sender:    "@other:test",
-					Content:   map[string]interface{}{"body": "Hey @testuser: check this"},
-					Timestamp: time.Now().AddDate(0, 0, -60).Unix() * 1000,
-				},
-			},
-			TimelineLimited: true,
-		},
-	}
-
-	actions := newTestActions(mc)
-	mentioned, err := actions.FindMentionedRooms(context.Background(), 30)
-	require.NoError(t, err)
-
-	assert.Len(t, mentioned, 0)
-}
-
-func TestFindMentionedRooms_NoFallbackWhenTimelineComplete(t *testing.T) {
-	mc := newMockClient()
-	mc.roomsWithTimeline = []helper.RoomWithTimeline{
-		{
-			Room:            helper.Room{ID: "!room1:test", Name: "Quiet room", LastActivity: time.Now().UnixMilli()},
-			TimelineEvents:  []helper.Message{},
-			TimelineLimited: false,
-		},
-	}
-	// Messages exist in mock but should NOT be fetched since timeline is complete
-	mc.messages["!room1:test"] = []helper.Message{
-		{
-			ID:        "msg1",
-			Sender:    "@other:test",
-			Content:   map[string]interface{}{"body": "Hey @testuser: check this"},
-			Timestamp: time.Now().Unix() * 1000,
-		},
-	}
-
-	actions := newTestActions(mc)
-	mentioned, err := actions.FindMentionedRooms(context.Background(), 30)
-	require.NoError(t, err)
-
-	assert.Len(t, mentioned, 0)
-}

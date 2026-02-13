@@ -8,11 +8,11 @@ A Go CLI tool for managing Matrix chat rooms: leave inactive rooms, find mention
 
 - **Leave rooms by keywords**: Leave rooms with closing keywords in their names (`close`, `done`, `resolved`, `completed`), with optional inactivity check
 - **Leave all inactive rooms**: Leave all rooms with no activity for a specified period, regardless of name
-- **Find mentions**: Locate rooms where you were mentioned, with direct links to Element and web interfaces
-- **Mark all as read**: Clear unread status for all rooms with a single command
+- **Find mentions**: Locate rooms where you were mentioned via the Matrix notifications API (`/notifications`), with direct links to Element and web interfaces
+- **Mark all as read**: Clear unread status for all rooms with a single command (only processes rooms with unread notifications)
 - **Interactive mode**: Enter credentials via terminal with masked password input
 - **Session caching**: Access token is cached after first login; subsequent runs reuse it without re-prompting
-- **Reliable API handling**: Built-in retry with exponential backoff, circuit breaker, and rate limiter
+- **Reliable API handling**: Built-in retry with exponential backoff, circuit breaker, rate limiter, and shared pause on server rate limits (429)
 
 ## Requirements
 
@@ -114,6 +114,16 @@ In interactive mode (`-i`), the access token is cached after the first successfu
 - **Logout**: run `matrix-helper --logout` to revoke the token server-side and remove the local cache
 
 On systems using `$XDG_RUNTIME_DIR` (most Linux distributions), the token is stored on tmpfs and automatically cleared on logout/reboot.
+
+## FAQ
+
+**Q: How does mention search work?**
+
+The tool uses the Matrix `/notifications` API with the `only=highlight` filter, which returns events that triggered highlighted notifications (mentions). The server determines what counts as a mention via push rules — this is more reliable than text-based matching and works with all mention formats. Results are paginated automatically, so no mentions are missed even in active rooms.
+
+**Q: How does rate limiting work?**
+
+The tool automatically limits request frequency to the Matrix server (20 requests/min). When a 429 (Too Many Requests) error is received, all parallel requests are paused for the duration specified by the server (`retry_after_ms`), then resume. Rate-limit retries do not count toward the normal retry limit.
 
 ## License
 
