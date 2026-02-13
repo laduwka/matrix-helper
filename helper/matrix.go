@@ -3,7 +3,8 @@ package helper
 import (
 	"context"
 	"fmt"
-	"strings"
+	"net/http"
+	"time"
 
 	"github.com/matrix-org/gomatrix"
 	"github.com/sirupsen/logrus"
@@ -14,64 +15,71 @@ type Config struct {
 	Username      string
 	Password      string
 	Domain        string
-}
-
-type Message struct {
-	ID        string
-	Sender    string
-	Content   map[string]interface{}
-	Type      string
-	Timestamp int64
+	DeviceID      string
 }
 
 type Room struct {
-	ID          string
-	Name        string
-	Topic       string
-	MemberCount int
-	JoinedAt    int64
+	ID                string
+	Name              string
+	Topic             string
+	LastActivity      int64
+	LastEventID       string
+	NotificationCount int
+}
+
+type Notification struct {
+	RoomID string
+	Event  gomatrix.Event
+	TS     int64
 }
 
 type Client interface {
-	GetRooms(ctx context.Context) ([]Room, error)
-	LeaveRoom(ctx context.Context, roomID string) error
+	GetRoomsViaSync(ctx context.Context) ([]Room, error)
+	GetNotifications(ctx context.Context, since int64) ([]Notification, error)
+	LeaveRoom(ctx context.Context, roomID, roomName string) error
 
-	GetMessages(ctx context.Context, roomID string, since int64) ([]Message, error)
 	GetLastMessageTimestamp(ctx context.Context, roomID string) (int64, error)
-	MarkRoomAsRead(ctx context.Context, roomID string) error
+	MarkRoomAsRead(ctx context.Context, roomID, roomName, lastEventID string) error
 
 	Config() Config
 	UserID() string
+	AccessToken() string
+	DeviceID() string
 }
 
 type matrixClient struct {
-	client    *gomatrix.Client
-	log       *logrus.Logger
-	config    Config
-	userID    string
-	retry     *Retry
+	client      *gomatrix.Client
+	log         *logrus.Logger
+	config      Config
+	userID      string
+	accessToken string
+	deviceID    string
+	retry       *Retry
+}
+
+type clientConfig struct {
 	retryOpts RetryOptions
 	cbOpts    CircuitBreakerOptions
 	rlOpts    RateLimiterOptions
 }
 
-type ClientOption func(*matrixClient)
+type ClientOption func(*clientConfig)
 
 func WithRetryOptions(opts RetryOptions) ClientOption {
-	return func(mc *matrixClient) {
-		mc.retryOpts = opts
+	return func(cc *clientConfig) {
+		cc.retryOpts = opts
 	}
 }
 
 func WithCircuitBreakerOptions(opts CircuitBreakerOptions) ClientOption {
-	return func(mc *matrixClient) {
-		mc.cbOpts = opts
+	return func(cc *clientConfig) {
+		cc.cbOpts = opts
 	}
 }
 
 func WithRateLimiterOptions(opts RateLimiterOptions) ClientOption {
-	return func(mc *matrixClient) {
-		mc.rlOpts = opts
+	return func(cc *clientConfig) {
+		cc.rlOpts = opts
 	}
 }
 
@@ -89,26 +97,38 @@ func NewClient(cfg Config, log *logrus.Logger, opts ...ClientOption) (Client, er
 		return nil, Wrap(err, "failed to create matrix client")
 	}
 
-	mc := &matrixClient{
-		client:    client,
-		log:       log,
-		config:    cfg,
+	cc := &clientConfig{
 		retryOpts: DefaultRetryOptions,
 		cbOpts:    DefaultCircuitBreakerOptions,
 		rlOpts:    DefaultRateLimiterOptions,
 	}
-
 	for _, opt := range opts {
-		opt(mc)
+		opt(cc)
 	}
 
-	mc.retry = NewRetry(mc.retryOpts, mc.cbOpts, mc.rlOpts)
+	client.Client = &http.Client{
+		Transport: &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 10,
+			IdleConnTimeout:     90 * time.Second,
+		},
+		Timeout: 2 * time.Minute,
+	}
+
+	mc := &matrixClient{
+		client: client,
+		log:    log,
+		config: cfg,
+		retry:  NewRetry(cc.retryOpts, cc.cbOpts, cc.rlOpts),
+	}
 
 	err = mc.retry.Do(context.Background(), func() error {
 		resp, err := client.Login(&gomatrix.ReqLogin{
-			Type:     "m.login.password",
-			User:     cfg.Username,
-			Password: cfg.Password,
+			Type:                     "m.login.password",
+			User:                     cfg.Username,
+			Password:                 cfg.Password,
+			DeviceID:                 cfg.DeviceID,
+			InitialDeviceDisplayName: "matrix-helper",
 		})
 		if err != nil {
 			return Wrap(err, "failed to login")
@@ -116,6 +136,8 @@ func NewClient(cfg Config, log *logrus.Logger, opts ...ClientOption) (Client, er
 
 		client.SetCredentials(resp.UserID, resp.AccessToken)
 		mc.userID = resp.UserID
+		mc.accessToken = resp.AccessToken
+		mc.deviceID = resp.DeviceID
 		return nil
 	})
 
@@ -134,123 +156,213 @@ func (c *matrixClient) UserID() string {
 	return c.userID
 }
 
-func (c *matrixClient) GetRooms(ctx context.Context) ([]Room, error) {
-	var rooms []Room
+func (c *matrixClient) AccessToken() string {
+	return c.accessToken
+}
 
-	err := c.retry.Do(ctx, func() error {
-		resp, err := c.client.JoinedRooms()
-		if err != nil {
-			return Wrap(err, "failed to get joined rooms")
-		}
+func (c *matrixClient) DeviceID() string {
+	return c.deviceID
+}
 
-		rooms = make([]Room, 0, len(resp.JoinedRooms))
-		for _, roomID := range resp.JoinedRooms {
-			room, err := c.getRoomInfo(roomID)
-			if err != nil {
-				c.log.WithError(err).WithField("room_id", roomID).Warn("Failed to get room info")
-				rooms = append(rooms, Room{
-					ID:   roomID,
-					Name: roomID,
-				})
-				continue
-			}
-			rooms = append(rooms, room)
-		}
-		return nil
-	})
+type whoamiResponse struct {
+	UserID string `json:"user_id"`
+}
 
+func NewClientFromToken(token *CachedToken, log *logrus.Logger, opts ...ClientOption) (Client, error) {
+	client, err := gomatrix.NewClient(token.HomeserverURL, token.UserID, token.AccessToken)
 	if err != nil {
-		return nil, Wrap(err, "failed to get rooms after retries")
+		return nil, Wrap(err, "failed to create matrix client from token")
+	}
+
+	cc := &clientConfig{
+		retryOpts: DefaultRetryOptions,
+		cbOpts:    DefaultCircuitBreakerOptions,
+		rlOpts:    DefaultRateLimiterOptions,
+	}
+	for _, opt := range opts {
+		opt(cc)
+	}
+
+	client.Client = &http.Client{
+		Transport: &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 10,
+			IdleConnTimeout:     90 * time.Second,
+		},
+		Timeout: 2 * time.Minute,
+	}
+
+	var resp whoamiResponse
+	err = client.MakeRequest(
+		"GET",
+		client.BuildURL("account", "whoami"),
+		nil,
+		&resp,
+	)
+	if err != nil {
+		return nil, Wrap(err, "cached token is invalid")
+	}
+	if resp.UserID != token.UserID {
+		return nil, fmt.Errorf("token user_id mismatch: expected %s, got %s", token.UserID, resp.UserID)
+	}
+
+	mc := &matrixClient{
+		client: client,
+		log:    log,
+		config: Config{
+			HomeserverURL: token.HomeserverURL,
+			Username:      token.Username,
+			Domain:        token.Domain,
+			DeviceID:      token.DeviceID,
+		},
+		userID:      token.UserID,
+		accessToken: token.AccessToken,
+		deviceID:    token.DeviceID,
+		retry:       NewRetry(cc.retryOpts, cc.cbOpts, cc.rlOpts),
+	}
+
+	return mc, nil
+}
+
+func LogoutAndCleanup(token *CachedToken) error {
+	client, err := gomatrix.NewClient(token.HomeserverURL, token.UserID, token.AccessToken)
+	if err != nil {
+		_ = RemoveToken()
+		return Wrap(err, "failed to create client for logout")
+	}
+
+	_, err = client.Logout()
+	_ = RemoveToken()
+	if err != nil {
+		return Wrap(err, "failed to logout from server")
+	}
+	return nil
+}
+
+const syncFilter = `{"presence":{"types":[]},"account_data":{"types":[]},"room":{"state":{"types":["m.room.name","m.room.topic"]},"timeline":{"limit":1},"ephemeral":{"types":[]},"account_data":{"types":[]}}}`
+
+// syncResponse is a custom sync response struct that captures unread_notifications
+// which gomatrix's RespSync does not support.
+type syncResponse struct {
+	Rooms struct {
+		Join map[string]syncJoinedRoom `json:"join"`
+	} `json:"rooms"`
+}
+
+type syncJoinedRoom struct {
+	State struct {
+		Events []gomatrix.Event `json:"events"`
+	} `json:"state"`
+	Timeline struct {
+		Events []gomatrix.Event `json:"events"`
+	} `json:"timeline"`
+	UnreadNotifications struct {
+		NotificationCount int `json:"notification_count"`
+		HighlightCount    int `json:"highlight_count"`
+	} `json:"unread_notifications"`
+}
+
+func (c *matrixClient) GetRoomsViaSync(ctx context.Context) ([]Room, error) {
+	var resp syncResponse
+	err := c.retry.Do(ctx, func() error {
+		query := map[string]string{
+			"timeout":      "0",
+			"filter":       syncFilter,
+			"full_state":   "true",
+			"set_presence": "offline",
+		}
+		urlPath := c.client.BuildURLWithQuery([]string{"sync"}, query)
+		return c.client.MakeRequest("GET", urlPath, nil, &resp)
+	})
+	if err != nil {
+		return nil, Wrap(err, "failed to sync after retries")
+	}
+
+	rooms := make([]Room, 0, len(resp.Rooms.Join))
+	for roomID, joinedRoom := range resp.Rooms.Join {
+		room := Room{ID: roomID, Name: roomID}
+
+		for _, ev := range joinedRoom.State.Events {
+			switch ev.Type {
+			case "m.room.name":
+				if name, ok := ev.Content["name"].(string); ok && name != "" {
+					room.Name = name
+				}
+			case "m.room.topic":
+				if topic, ok := ev.Content["topic"].(string); ok {
+					room.Topic = topic
+				}
+			}
+		}
+
+		if len(joinedRoom.Timeline.Events) > 0 {
+			last := joinedRoom.Timeline.Events[len(joinedRoom.Timeline.Events)-1]
+			room.LastActivity = last.Timestamp
+			room.LastEventID = last.ID
+		}
+
+		room.NotificationCount = joinedRoom.UnreadNotifications.NotificationCount
+		rooms = append(rooms, room)
 	}
 
 	return rooms, nil
 }
 
-func (c *matrixClient) getRoomInfo(roomID string) (Room, error) {
-	room := Room{
-		ID: roomID,
-	}
-
-	var nameContent struct {
-		Name string `json:"name"`
-	}
-	err := c.client.StateEvent(roomID, "m.room.name", "", &nameContent)
-	if err == nil && nameContent.Name != "" {
-		room.Name = nameContent.Name
-	} else {
-		room.Name = roomID
-	}
-
-	var topicContent struct {
-		Topic string `json:"topic"`
-	}
-	err = c.client.StateEvent(roomID, "m.room.topic", "", &topicContent)
-	if err == nil {
-		room.Topic = topicContent.Topic
-	}
-
-	return room, nil
+type notificationsResponse struct {
+	Notifications []struct {
+		Event  gomatrix.Event `json:"event"`
+		RoomID string         `json:"room_id"`
+		TS     int64          `json:"ts"`
+	} `json:"notifications"`
+	NextToken string `json:"next_token"`
 }
 
-func (c *matrixClient) getRoomNameSafe(roomID string) string {
-	var nameContent struct {
-		Name string `json:"name"`
-	}
-	err := c.client.StateEvent(roomID, "m.room.name", "", &nameContent)
+func (c *matrixClient) GetNotifications(ctx context.Context, since int64) ([]Notification, error) {
+	var all []Notification
+	from := ""
 
-	if err == nil && nameContent.Name != "" {
-		return nameContent.Name
-	}
-
-	var summaryContent struct {
-		Heroes      []string `json:"m.heroes"`
-		Invitecount int      `json:"m.invited_member_count"`
-		Joincount   int      `json:"m.joined_member_count"`
-	}
-
-	err = c.client.StateEvent(roomID, "m.room.summary", "", &summaryContent)
-	if err == nil && len(summaryContent.Heroes) > 0 {
-		return "Direct chat with " + strings.Join(summaryContent.Heroes, ", ")
-	}
-
-	return roomID
-}
-
-func (c *matrixClient) GetMessages(ctx context.Context, roomID string, since int64) ([]Message, error) {
-	var messages []Message
-
-	err := c.retry.Do(ctx, func() error {
-
-		resp, err := c.client.Messages(roomID, "", "", 'b', 100)
+	for {
+		var resp notificationsResponse
+		currentFrom := from
+		err := c.retry.Do(ctx, func() error {
+			query := map[string]string{
+				"limit": "100",
+				"only":  "highlight",
+			}
+			if currentFrom != "" {
+				query["from"] = currentFrom
+			}
+			urlPath := c.client.BuildURLWithQuery([]string{"notifications"}, query)
+			return c.client.MakeRequest("GET", urlPath, nil, &resp)
+		})
 		if err != nil {
-			return Wrap(err, "failed to get messages")
+			return all, Wrap(err, "failed to get notifications")
 		}
 
-		messages = make([]Message, 0, len(resp.Chunk))
-		for _, event := range resp.Chunk {
-
-			if event.Timestamp < since {
-				continue
-			}
-
-			if event.Type == "m.room.message" {
-				messages = append(messages, Message{
-					ID:        event.ID,
-					Sender:    event.Sender,
-					Content:   event.Content,
-					Type:      event.Type,
-					Timestamp: event.Timestamp,
-				})
-			}
+		if len(resp.Notifications) == 0 {
+			break
 		}
-		return nil
-	})
 
-	if err != nil {
-		return nil, Wrap(err, "failed to get messages after retries")
+		reachedEnd := false
+		for _, n := range resp.Notifications {
+			if n.TS < since {
+				reachedEnd = true
+				break
+			}
+			all = append(all, Notification{
+				RoomID: n.RoomID,
+				Event:  n.Event,
+				TS:     n.TS,
+			})
+		}
+
+		if reachedEnd || resp.NextToken == "" {
+			break
+		}
+		from = resp.NextToken
 	}
 
-	return messages, nil
+	return all, nil
 }
 
 func (c *matrixClient) GetLastMessageTimestamp(ctx context.Context, roomID string) (int64, error) {
@@ -273,10 +385,7 @@ func (c *matrixClient) GetLastMessageTimestamp(ctx context.Context, roomID strin
 
 	if err != nil {
 
-		c.log.WithError(err).WithFields(logrus.Fields{
-			"room_id":   roomID,
-			"room_name": c.getRoomNameSafe(roomID),
-		}).Debug("Failed to get last message timestamp")
+		c.log.WithError(err).WithField("room_id", roomID).Debug("Failed to get last message timestamp")
 
 		return 0, Wrap(err, "failed to get last message timestamp")
 	}
@@ -284,14 +393,8 @@ func (c *matrixClient) GetLastMessageTimestamp(ctx context.Context, roomID strin
 	return timestamp, nil
 }
 
-func (c *matrixClient) LeaveRoom(ctx context.Context, roomID string) error {
-	roomName := c.getRoomNameSafe(roomID)
-	noRLRetry := NewRetry(
-		c.retryOpts,
-		c.cbOpts,
-		RateLimiterOptions{Enabled: false},
-	)
-	err := noRLRetry.Do(ctx, func() error {
+func (c *matrixClient) LeaveRoom(ctx context.Context, roomID, roomName string) error {
+	err := c.retry.Do(ctx, func() error {
 		_, err := c.client.LeaveRoom(roomID)
 		if err != nil {
 			c.log.WithError(err).WithFields(logrus.Fields{
@@ -300,43 +403,33 @@ func (c *matrixClient) LeaveRoom(ctx context.Context, roomID string) error {
 			}).Debug("Failed to leave room")
 			return Wrap(err, "failed to leave room")
 		}
-
-		c.log.WithFields(logrus.Fields{
-			"room_name": roomName,
-		}).Info("Successfully left room")
-
 		return nil
 	})
 
 	return err
 }
 
-func (c *matrixClient) MarkRoomAsRead(ctx context.Context, roomID string) error {
-	roomName := c.getRoomNameSafe(roomID)
-
-	noRLRetry := NewRetry(
-		c.retryOpts,
-		c.cbOpts,
-		RateLimiterOptions{Enabled: false},
-	)
-	err := noRLRetry.Do(ctx, func() error {
-		resp, err := c.client.Messages(roomID, "", "", 'b', 1)
-		if err != nil {
-			c.log.WithError(err).WithFields(logrus.Fields{
-				"room_id":   roomID,
-				"room_name": roomName,
-			}).Debug("Failed to get messages for marking room as read")
-			return Wrap(err, "failed to get messages")
+func (c *matrixClient) MarkRoomAsRead(ctx context.Context, roomID, roomName, lastEventID string) error {
+	err := c.retry.Do(ctx, func() error {
+		eventID := lastEventID
+		if eventID == "" {
+			resp, err := c.client.Messages(roomID, "", "", 'b', 1)
+			if err != nil {
+				c.log.WithError(err).WithFields(logrus.Fields{
+					"room_id":   roomID,
+					"room_name": roomName,
+				}).Debug("Failed to get messages for marking room as read")
+				return Wrap(err, "failed to get messages")
+			}
+			if len(resp.Chunk) == 0 {
+				return nil
+			}
+			eventID = resp.Chunk[0].ID
 		}
 
-		if len(resp.Chunk) == 0 {
-
-			return nil
-		}
-
-		err = c.client.MakeRequest(
+		err := c.client.MakeRequest(
 			"POST",
-			c.client.BuildURL("rooms", roomID, "receipt", "m.read", resp.Chunk[0].ID),
+			c.client.BuildURL("rooms", roomID, "receipt", "m.read", eventID),
 			struct{}{},
 			nil,
 		)
@@ -353,28 +446,8 @@ func (c *matrixClient) MarkRoomAsRead(ctx context.Context, roomID string) error 
 		}).Debug("Successfully marked room as read")
 
 		return nil
-	})
+	}, WithoutRateLimit())
 
 	return err
 }
 
-func (m *Message) ContainsMention(username string) bool {
-	body, ok := m.Content["body"].(string)
-	if !ok {
-		return false
-	}
-	mentionFormat := fmt.Sprintf("@%s:", username)
-	return strings.Contains(body, mentionFormat)
-}
-
-func (m *Message) IsFromUser(userID string) bool {
-	return m.Sender == userID
-}
-
-func (m *Message) GetBody() string {
-	body, ok := m.Content["body"].(string)
-	if !ok {
-		return ""
-	}
-	return body
-}

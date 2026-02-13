@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"math/rand"
-	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/cenkalti/backoff/v4"
 	"github.com/matrix-org/gomatrix"
+	"github.com/sony/gobreaker/v2"
+	"golang.org/x/time/rate"
 )
 
 type RetryOptions struct {
@@ -61,144 +63,113 @@ type RateLimitError struct {
 	RetryAfterMs int64  `json:"retry_after_ms"`
 }
 
-type CircuitBreaker struct {
-	mutex         sync.RWMutex
-	state         string
-	failures      int
-	lastFailure   time.Time
-	threshold     int
-	timeout       time.Duration
-	shouldTrip    func(err error) bool
-	onStateChange func(from, to string)
+// DoOption configures a single Do call.
+type doConfig struct {
+	skipRateLimit bool
 }
 
-func NewCircuitBreaker(opts CircuitBreakerOptions) *CircuitBreaker {
-	cb := &CircuitBreaker{
-		state:         "closed",
-		failures:      0,
-		threshold:     opts.Threshold,
-		timeout:       opts.Timeout,
-		shouldTrip:    opts.ShouldTrip,
-		onStateChange: opts.OnStateChange,
-	}
-	return cb
-}
+type DoOption func(*doConfig)
 
-func (cb *CircuitBreaker) Allow() bool {
-	cb.mutex.RLock()
-	defer cb.mutex.RUnlock()
-	return cb.state != "open"
-}
-
-func (cb *CircuitBreaker) Success() {
-	cb.mutex.Lock()
-	defer cb.mutex.Unlock()
-
-	prevState := cb.state
-
-	if cb.state == "half-open" {
-		cb.state = "closed"
-		cb.failures = 0
-	}
-
-	if cb.state == "closed" {
-		cb.failures = 0
-	}
-
-	if cb.onStateChange != nil && prevState != cb.state {
-		cb.onStateChange(prevState, cb.state)
+// WithoutRateLimit skips the rate limiter for this call.
+func WithoutRateLimit() DoOption {
+	return func(c *doConfig) {
+		c.skipRateLimit = true
 	}
 }
 
-func (cb *CircuitBreaker) Failure(err error) {
-	if !cb.shouldTrip(err) {
-		return
-	}
-
-	cb.mutex.Lock()
-	defer cb.mutex.Unlock()
-
-	prevState := cb.state
-
-	cb.failures++
-	cb.lastFailure = time.Now()
-
-	if cb.state == "closed" && cb.failures >= cb.threshold {
-		cb.state = "open"
-	}
-
-	if cb.state == "half-open" {
-		cb.state = "open"
-	}
-
-	if cb.onStateChange != nil && prevState != cb.state {
-		cb.onStateChange(prevState, cb.state)
-	}
+// smartBackOff wraps an ExponentialBackOff and overrides the delay
+// when a 429 response includes retry_after_ms.
+// Rate-limit retries (429) do not count toward maxRetries, allowing
+// the operation to keep retrying as long as the server asks to wait.
+// A separate maxRateLimitRetries cap prevents infinite loops.
+type smartBackOff struct {
+	inner              backoff.BackOff
+	lastErr            *error
+	maxRetries         uint64
+	numRetries         uint64
+	maxRateLimitRetries uint64
+	numRateLimitRetries uint64
 }
 
-func (cb *CircuitBreaker) CheckState() string {
-	cb.mutex.Lock()
-	defer cb.mutex.Unlock()
-
-	if cb.state == "open" && time.Since(cb.lastFailure) > cb.timeout {
-		prevState := cb.state
-		cb.state = "half-open"
-		if cb.onStateChange != nil {
-			cb.onStateChange(prevState, cb.state)
+func (s *smartBackOff) NextBackOff() time.Duration {
+	if s.lastErr != nil && *s.lastErr != nil {
+		if delay := extractRetryAfter(*s.lastErr); delay > 0 {
+			s.numRateLimitRetries++
+			if s.maxRateLimitRetries > 0 && s.numRateLimitRetries > s.maxRateLimitRetries {
+				return backoff.Stop
+			}
+			return delay
 		}
 	}
 
-	return cb.state
-}
-
-func (cb *CircuitBreaker) State() string {
-	cb.mutex.RLock()
-	defer cb.mutex.RUnlock()
-	return cb.state
-}
-
-type TokenBucket struct {
-	mutex      sync.Mutex
-	tokens     float64
-	rate       float64
-	capacity   float64
-	lastRefill time.Time
-}
-
-func NewTokenBucket(opts RateLimiterOptions) *TokenBucket {
-	tokensPerSecond := float64(opts.Rate) / opts.Interval.Seconds()
-	return &TokenBucket{
-		tokens:     float64(opts.Capacity),
-		rate:       tokensPerSecond,
-		capacity:   float64(opts.Capacity),
-		lastRefill: time.Now(),
-	}
-}
-
-func (tb *TokenBucket) Allow() bool {
-	tb.mutex.Lock()
-	defer tb.mutex.Unlock()
-
-	now := time.Now()
-	elapsed := now.Sub(tb.lastRefill).Seconds()
-	tb.lastRefill = now
-
-	tb.tokens += elapsed * tb.rate
-	if tb.tokens > tb.capacity {
-		tb.tokens = tb.capacity
+	s.numRetries++
+	if s.numRetries > s.maxRetries {
+		return backoff.Stop
 	}
 
-	if tb.tokens >= 1.0 {
-		tb.tokens -= 1.0
-		return true
-	}
-	return false
+	return s.inner.NextBackOff()
 }
 
+func (s *smartBackOff) Reset() {
+	s.inner.Reset()
+	s.numRetries = 0
+	s.numRateLimitRetries = 0
+}
+
+// extractRetryAfter parses retry_after_ms from a 429 HTTP error response.
+func extractRetryAfter(err error) time.Duration {
+	var httpErr *gomatrix.HTTPError
+	if errors.As(err, &httpErr) && httpErr.Code == 429 && httpErr.Contents != nil {
+		var rateLimit RateLimitError
+		if json.Unmarshal(httpErr.Contents, &rateLimit) == nil && rateLimit.RetryAfterMs > 0 {
+			serverDelay := time.Duration(rateLimit.RetryAfterMs) * time.Millisecond
+			return time.Duration(float64(serverDelay) * 1.1)
+		}
+	}
+	return 0
+}
+
+// Retry combines retry with exponential backoff, circuit breaker, and rate limiting.
+// The pausedUntil field provides cross-goroutine coordination: when any goroutine
+// receives a 429, all goroutines pause until the server-specified deadline.
 type Retry struct {
-	retryOpts      RetryOptions
-	circuitBreaker *CircuitBreaker
-	rateLimiter    *TokenBucket
+	retryOpts   RetryOptions
+	cb          *gobreaker.CircuitBreaker[struct{}]
+	rateLimiter *rate.Limiter
+	pausedUntil atomic.Int64 // unix nanoseconds; 0 = not paused
+}
+
+// setPause records a server-requested pause. If the new deadline is later
+// than the current one, it wins (concurrent 429s → longest pause prevails).
+func (r *Retry) setPause(d time.Duration) {
+	deadline := time.Now().Add(d).UnixNano()
+	for {
+		current := r.pausedUntil.Load()
+		if deadline <= current {
+			return
+		}
+		if r.pausedUntil.CompareAndSwap(current, deadline) {
+			return
+		}
+	}
+}
+
+// waitForPause blocks until the shared pause expires or the context is cancelled.
+func (r *Retry) waitForPause(ctx context.Context) error {
+	deadline := r.pausedUntil.Load()
+	if deadline == 0 {
+		return nil
+	}
+	remaining := time.Until(time.Unix(0, deadline))
+	if remaining <= 0 {
+		return nil
+	}
+	select {
+	case <-time.After(remaining):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func NewRetry(retryOpts RetryOptions, cbOpts CircuitBreakerOptions, rlOpts RateLimiterOptions) *Retry {
@@ -207,93 +178,104 @@ func NewRetry(retryOpts RetryOptions, cbOpts CircuitBreakerOptions, rlOpts RateL
 	}
 
 	if cbOpts.Enabled {
-		r.circuitBreaker = NewCircuitBreaker(cbOpts)
+		settings := gobreaker.Settings{
+			Name:    "matrix-helper",
+			Timeout: cbOpts.Timeout,
+			ReadyToTrip: func(counts gobreaker.Counts) bool {
+				return int(counts.ConsecutiveFailures) >= cbOpts.Threshold
+			},
+			IsSuccessful: func(err error) bool {
+				if err == nil {
+					return true
+				}
+				if cbOpts.ShouldTrip != nil {
+					return !cbOpts.ShouldTrip(err)
+				}
+				return false
+			},
+		}
+		if cbOpts.OnStateChange != nil {
+			settings.OnStateChange = func(name string, from, to gobreaker.State) {
+				cbOpts.OnStateChange(from.String(), to.String())
+			}
+		}
+		r.cb = gobreaker.NewCircuitBreaker[struct{}](settings)
 	}
 
 	if rlOpts.Enabled {
-		r.rateLimiter = NewTokenBucket(rlOpts)
+		tokensPerSecond := rate.Limit(float64(rlOpts.Rate) / rlOpts.Interval.Seconds())
+		r.rateLimiter = rate.NewLimiter(tokensPerSecond, rlOpts.Capacity)
 	}
 
 	return r
 }
 
-func (r *Retry) Do(ctx context.Context, operation func() error) error {
-	var err error
+// Do executes the operation with retry, circuit breaker, and rate limiting.
+func (r *Retry) Do(ctx context.Context, operation func() error, opts ...DoOption) error {
+	cfg := &doConfig{}
+	for _, o := range opts {
+		o(cfg)
+	}
 
-	if r.circuitBreaker != nil {
-		r.circuitBreaker.CheckState()
-		if !r.circuitBreaker.Allow() {
-			return errors.New("circuit breaker is open")
+	// Rate limiter: wait for a token before proceeding
+	if r.rateLimiter != nil && !cfg.skipRateLimit {
+		if err := r.rateLimiter.Wait(ctx); err != nil {
+			return err
 		}
 	}
 
-	if r.rateLimiter != nil {
-		if !r.rateLimiter.Allow() {
-			return errors.New("rate limit exceeded")
-		}
-	}
-
-	for attempt := 0; attempt < r.retryOpts.MaxAttempts; attempt++ {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-			if err = operation(); err == nil {
-
-				if r.circuitBreaker != nil {
-					r.circuitBreaker.Success()
-				}
-				return nil
-			}
-
-			if r.circuitBreaker != nil {
-				r.circuitBreaker.Failure(err)
-			}
-
-			if attempt == r.retryOpts.MaxAttempts-1 {
-				return err
-			}
-
-			delay := r.calculateSmartDelay(err, attempt)
-
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(delay):
-			}
-		}
-	}
-
-	return err
-}
-
-func (r *Retry) calculateSmartDelay(err error, attempt int) time.Duration {
-
-	delay := r.retryOpts.BaseDelay * time.Duration(1<<uint(attempt))
-	if delay > r.retryOpts.MaxDelay {
-		delay = r.retryOpts.MaxDelay
-	}
-
+	// Set up exponential backoff
+	var lastErr error
+	eb := backoff.NewExponentialBackOff()
+	eb.InitialInterval = r.retryOpts.BaseDelay
+	eb.MaxInterval = r.retryOpts.MaxDelay
+	eb.MaxElapsedTime = 0 // no total time limit; controlled by max retries
 	if r.retryOpts.UseJitter {
-		jitter := 0.8 + (0.4 * rand.Float64())
-		delayNs := float64(delay.Nanoseconds())
-		delay = time.Duration(int64(delayNs * jitter))
+		eb.RandomizationFactor = 0.2
+	} else {
+		eb.RandomizationFactor = 0
 	}
 
-	var httpErr *gomatrix.HTTPError
-	if errors.As(err, &httpErr) && httpErr.Code == 429 {
+	smart := &smartBackOff{
+		inner:               eb,
+		lastErr:             &lastErr,
+		maxRetries:          uint64(r.retryOpts.MaxAttempts - 1),
+		maxRateLimitRetries: 10,
+	}
+	bCtx := backoff.WithContext(smart, ctx)
 
-		if httpErr.Contents != nil {
-			var rateLimit RateLimitError
-			if err := json.Unmarshal(httpErr.Contents, &rateLimit); err == nil {
-				if rateLimit.RetryAfterMs > 0 {
-					serverDelay := time.Duration(rateLimit.RetryAfterMs) * time.Millisecond
+	wrappedOp := func() error {
+		// Wait for any shared pause set by another goroutine's 429.
+		if err := r.waitForPause(ctx); err != nil {
+			return backoff.Permanent(err)
+		}
 
-					return time.Duration(float64(serverDelay) * 1.1)
+		var err error
+		if r.cb != nil {
+			_, err = r.cb.Execute(func() (struct{}, error) {
+				return struct{}{}, operation()
+			})
+			if err != nil {
+				if errors.Is(err, gobreaker.ErrOpenState) || errors.Is(err, gobreaker.ErrTooManyRequests) {
+					lastErr = err
+					return backoff.Permanent(err)
 				}
 			}
+		} else {
+			err = operation()
 		}
+
+		lastErr = err
+
+		// If this was a 429, pause ALL goroutines for the server-specified duration.
+		if err != nil {
+			if delay := extractRetryAfter(err); delay > 0 {
+				r.setPause(delay)
+			}
+		}
+
+		return err
 	}
 
-	return delay
+	return backoff.Retry(wrappedOp, bCtx)
 }

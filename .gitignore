@@ -14,3 +14,4 @@ matrix-helper
 # Config
 config.local.yaml
 .env
+.claude

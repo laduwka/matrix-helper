@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"flag"
 	"fmt"
@@ -11,11 +12,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/fatih/color"
 	"github.com/laduwka/matrix-helper/app"
 	"github.com/laduwka/matrix-helper/helper"
-
 	"github.com/sirupsen/logrus"
+	"golang.org/x/term"
 )
+
+var version = "dev"
 
 type CLI struct {
 	actions app.ActionService
@@ -26,6 +30,7 @@ func main() {
 
 	helpFlag := flag.Bool("help", false, "Display help information")
 	hFlag := flag.Bool("h", false, "Display help information (shorthand)")
+	versionFlag := flag.Bool("version", false, "Display version information")
 
 	leaveFlag := flag.Bool("leave", false, "Leave rooms mode")
 	leaveInactiveDays := flag.Int("days", 0, "Number of days of inactivity (with --leave)")
@@ -34,7 +39,13 @@ func main() {
 	mentionsFlag := flag.Bool("mentions", false, "Find rooms with mentions mode")
 	mentionsDays := flag.Int("mention-days", 30, "Days to look back for mentions")
 
+	leaveInactiveFlag := flag.Bool("leave-inactive", false, "Leave all inactive rooms mode")
+
 	markReadFlag := flag.Bool("mark-read", false, "Mark all rooms as read mode")
+
+	interactiveFlag := flag.Bool("i", false, "Interactive mode with credential prompting")
+
+	logoutFlag := flag.Bool("logout", false, "Revoke cached session and remove stored token")
 
 	flag.Parse()
 
@@ -43,13 +54,21 @@ func main() {
 		return
 	}
 
+	if *versionFlag {
+		fmt.Printf("matrix-helper %s\n", version)
+		return
+	}
+
 	config := &RunConfig{
 		LeaveMode:         *leaveFlag,
+		LeaveInactiveMode: *leaveInactiveFlag,
 		LeaveInactiveDays: *leaveInactiveDays,
 		NoConfirm:         *noConfirm,
 		MentionsMode:      *mentionsFlag,
 		MentionsDays:      *mentionsDays,
 		MarkReadMode:      *markReadFlag,
+		Interactive:       *interactiveFlag,
+		Logout:            *logoutFlag,
 	}
 
 	if err := run(config); err != nil {
@@ -59,9 +78,12 @@ func main() {
 }
 
 type RunConfig struct {
-	LeaveMode    bool
-	MentionsMode bool
-	MarkReadMode bool
+	LeaveMode         bool
+	LeaveInactiveMode bool
+	MentionsMode      bool
+	MarkReadMode      bool
+	Interactive       bool
+	Logout            bool
 
 	LeaveInactiveDays int
 	MentionsDays      int
@@ -79,12 +101,20 @@ func printHelp() {
 
 	fmt.Println("\nGENERAL FLAGS:")
 	fmt.Println("  -h, --help     Display this help message")
+	fmt.Println("  --version      Display version information")
+	fmt.Println("  -i             Interactive mode (prompt for credentials)")
+	fmt.Println("  --logout       Revoke cached session and remove stored token")
 
 	fmt.Println("\nLEAVE ROOMS MODE:")
 	fmt.Println("  --leave        Activate leave rooms mode")
 	fmt.Println("  --days=N       Number of days of inactivity to check (default: 0)")
 	fmt.Println("                 Use 0 to only check room names for closing keywords")
 	fmt.Println("  --no-confirm   Skip confirmation prompt before leaving rooms")
+
+	fmt.Println("\nLEAVE INACTIVE ROOMS MODE:")
+	fmt.Println("  --leave-inactive   Leave ALL rooms inactive for N days")
+	fmt.Println("  --days=N           Number of days of inactivity (required, must be > 0)")
+	fmt.Println("  --no-confirm       Skip confirmation prompt")
 
 	fmt.Println("\nFIND MENTIONS MODE:")
 	fmt.Println("  --mentions         Activate find mentions mode")
@@ -121,27 +151,58 @@ func printHelp() {
 	fmt.Println("  matrix-helper --leave --days=90 --no-confirm")
 }
 
+var (
+	titleColor   = color.New(color.FgCyan, color.Bold)
+	successColor = color.New(color.FgGreen)
+	warnColor    = color.New(color.FgYellow)
+	errorColor   = color.New(color.FgRed)
+)
+
+var progressFn = func(current, total int, message string) {
+	if total == 0 {
+		fmt.Printf("  %s\n", message)
+	} else {
+		fmt.Printf("  %s: %d/%d\n", message, current, total)
+	}
+}
+
 func run(config *RunConfig) error {
+	if config.Logout {
+		return runLogout()
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	setupSignalHandler(cancel)
 
-	app, err := initializeApp()
+	var cli *CLI
+	var err error
+
+	hasModeFlag := config.LeaveMode || config.LeaveInactiveMode || config.MentionsMode || config.MarkReadMode
+	if !hasModeFlag || config.Interactive {
+		cli, err = initializeInteractiveApp()
+	} else {
+		cli, err = initializeApp()
+	}
 	if err != nil {
 		return fmt.Errorf("failed to initialize application: %w", err)
 	}
 
 	if config.LeaveMode {
-		return app.leaveRoomsByDateWithConfig(ctx, config.LeaveInactiveDays, config.NoConfirm)
+		return cli.leaveRoomsByDateWithConfig(ctx, config.LeaveInactiveDays, config.NoConfirm)
+	} else if config.LeaveInactiveMode {
+		if config.LeaveInactiveDays <= 0 {
+			return fmt.Errorf("--days must be > 0 when using --leave-inactive")
+		}
+		return cli.leaveInactiveRoomsWithConfig(ctx, config.LeaveInactiveDays, config.NoConfirm)
 	} else if config.MentionsMode {
-		return app.findMentionedRoomsWithConfig(ctx, config.MentionsDays)
+		return cli.findMentionedRoomsWithConfig(ctx, config.MentionsDays)
 	} else if config.MarkReadMode {
-		return app.markAllAsRead(ctx)
+		return cli.markAllAsRead(ctx)
 	}
 
-	if err := app.RunCLI(ctx); err != nil {
+	if err := cli.RunCLI(ctx); err != nil {
 		return fmt.Errorf("CLI execution failed: %w", err)
 	}
 
@@ -156,6 +217,183 @@ func setupSignalHandler(cancel context.CancelFunc) {
 		fmt.Println("\nShutting down gracefully...")
 		cancel()
 	}()
+}
+
+func promptCredentials() (domain, username, password string, err error) {
+	reader := bufio.NewReader(os.Stdin)
+
+	titleColor.Println("Matrix Helper - Interactive Setup")
+	titleColor.Println("==================================")
+	fmt.Println()
+
+	fmt.Print("Matrix homeserver domain [matrix.bingo-boom.ru]: ")
+	domain, _ = reader.ReadString('\n')
+	domain = strings.TrimSpace(domain)
+	if domain == "" {
+		domain = "matrix.bingo-boom.ru"
+	}
+
+	fmt.Print("Username: ")
+	username, _ = reader.ReadString('\n')
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return "", "", "", fmt.Errorf("username is required")
+	}
+
+	fmt.Print("Password: ")
+	if term.IsTerminal(int(syscall.Stdin)) {
+		passwordBytes, err := term.ReadPassword(int(syscall.Stdin))
+		if err != nil {
+			return "", "", "", fmt.Errorf("failed to read password: %w", err)
+		}
+		fmt.Println()
+		password = string(passwordBytes)
+	} else {
+		password, _ = reader.ReadString('\n')
+		password = strings.TrimSpace(password)
+	}
+
+	if password == "" {
+		return "", "", "", fmt.Errorf("password is required")
+	}
+
+	return domain, username, password, nil
+}
+
+func interactiveClientOpts(log *logrus.Logger) []helper.ClientOption {
+	return []helper.ClientOption{
+		helper.WithRetryOptions(helper.RetryOptions{
+			MaxAttempts: 3,
+			BaseDelay:   time.Second,
+			MaxDelay:    time.Second * 5,
+			UseJitter:   true,
+		}),
+		helper.WithCircuitBreakerOptions(helper.CircuitBreakerOptions{
+			Threshold: 5,
+			Timeout:   time.Minute * 2,
+			Enabled:   true,
+			ShouldTrip: func(err error) bool {
+				return !strings.Contains(err.Error(), "rate limit") &&
+					!strings.Contains(err.Error(), "M_LIMIT_EXCEEDED")
+			},
+			OnStateChange: func(from, to string) {
+				log.Infof("Circuit breaker state changed from %s to %s", from, to)
+			},
+		}),
+		helper.WithRateLimiterOptions(helper.RateLimiterOptions{
+			Rate:     20,
+			Interval: time.Minute,
+			Capacity: 5,
+			Enabled:  true,
+		}),
+	}
+}
+
+func initializeInteractiveApp() (*CLI, error) {
+	log := app.NewLogger(app.LoggerConfig{Level: "info", Format: "text"})
+
+	// Try cached token first
+	cached, err := helper.LoadToken()
+	if err != nil {
+		warnColor.Printf("Warning: failed to load cached session: %v\n", err)
+	}
+
+	if cached != nil {
+		successColor.Printf("Found cached session for %s\n", cached.UserID)
+		successColor.Printf("Connecting to %s...\n", cached.HomeserverURL)
+
+		client, err := helper.NewClientFromToken(cached, log, interactiveClientOpts(log)...)
+		if err != nil {
+			warnColor.Printf("Cached session is invalid: %v\n", err)
+			warnColor.Println("Falling back to credential prompt...")
+			_ = helper.RemoveToken()
+			fmt.Println()
+		} else {
+			successColor.Println("Connected successfully!")
+			fmt.Println()
+
+			actionService := app.NewActions(
+				client,
+				log,
+				app.WithConcurrency(5),
+				app.WithProgress(progressFn),
+			)
+			return &CLI{actions: actionService, log: log}, nil
+		}
+	}
+
+	// No valid cached token — prompt for credentials
+	domain, username, password, err := promptCredentials()
+	if err != nil {
+		return nil, err
+	}
+
+	cfg := app.LoadFromValues(domain, username, password)
+	log = app.NewLogger(cfg.Log.ToLoggerConfig())
+
+	fmt.Println()
+	successColor.Printf("Connecting to %s...\n", cfg.Matrix.HomeserverURL)
+
+	client, err := helper.NewClient(
+		cfg.Matrix.ToMatrixConfig(),
+		log,
+		interactiveClientOpts(log)...,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize matrix client: %w", err)
+	}
+
+	successColor.Println("Connected successfully!")
+
+	// Cache the token for future runs
+	token := &helper.CachedToken{
+		HomeserverURL: cfg.Matrix.HomeserverURL,
+		UserID:        client.UserID(),
+		AccessToken:   client.AccessToken(),
+		DeviceID:      client.DeviceID(),
+		Username:      username,
+		Domain:        domain,
+		CreatedAt:     time.Now(),
+	}
+	if err := helper.SaveToken(token); err != nil {
+		warnColor.Printf("Warning: failed to cache session: %v\n", err)
+	} else {
+		successColor.Println("Session cached for future runs")
+	}
+	fmt.Println()
+
+	actionService := app.NewActions(
+		client,
+		log,
+		app.WithConcurrency(5),
+		app.WithProgress(progressFn),
+	)
+
+	return &CLI{
+		actions: actionService,
+		log:     log,
+	}, nil
+}
+
+func runLogout() error {
+	token, err := helper.LoadToken()
+	if err != nil {
+		return fmt.Errorf("failed to load cached session: %w", err)
+	}
+	if token == nil {
+		fmt.Println("No cached session found.")
+		return nil
+	}
+
+	fmt.Printf("Logging out session for %s...\n", token.UserID)
+	if err := helper.LogoutAndCleanup(token); err != nil {
+		warnColor.Printf("Warning: server-side logout failed: %v\n", err)
+		fmt.Println("Local token has been removed.")
+		return nil
+	}
+
+	successColor.Println("Logged out successfully. Cached session removed.")
+	return nil
 }
 
 func initializeApp() (*CLI, error) {
@@ -189,9 +427,9 @@ func initializeApp() (*CLI, error) {
 	}
 
 	rlOpts := helper.RateLimiterOptions{
-		Rate:     10,
+		Rate:     20,
 		Interval: time.Minute,
-		Capacity: 15,
+		Capacity: 5,
 		Enabled:  true,
 	}
 
@@ -211,6 +449,7 @@ func initializeApp() (*CLI, error) {
 		client,
 		log,
 		app.WithConcurrency(5),
+		app.WithProgress(progressFn),
 	)
 
 	return &CLI{
@@ -220,40 +459,31 @@ func initializeApp() (*CLI, error) {
 }
 
 func (c *CLI) RunCLI(ctx context.Context) error {
-	fmt.Println("Matrix Helper")
-	fmt.Println("=============")
+	titleColor.Println("Matrix Helper")
+	titleColor.Println("=============")
 	fmt.Println("Choose an action:")
-	fmt.Println("1. Leave rooms")
-	fmt.Println("2. Find rooms with mentions")
-	fmt.Println("3. Mark all rooms as read")
-	fmt.Print("Enter your choice (1-3): ")
+	fmt.Println("  1. Leave rooms (with closing keywords)")
+	fmt.Println("  2. Find rooms with mentions")
+	fmt.Println("  3. Mark all rooms as read")
+	fmt.Println("  4. Leave inactive rooms")
+	fmt.Print("Enter your choice (1-4): ")
 
 	var input string
 	if _, err := fmt.Scanln(&input); err != nil {
 		return fmt.Errorf("failed to read choice: %w", err)
 	}
 
-	var choice int
 	switch input {
 	case "1":
-		choice = 1
-	case "2":
-		choice = 2
-	case "3":
-		choice = 3
-	default:
-		return fmt.Errorf("invalid choice: %q (must be 1-3)", input)
-	}
-
-	switch choice {
-	case 1:
 		return c.leaveRoomsByDate(ctx)
-	case 2:
+	case "2":
 		return c.findMentionedRooms(ctx)
-	case 3:
+	case "3":
 		return c.markAllAsRead(ctx)
+	case "4":
+		return c.leaveInactiveRooms(ctx)
 	default:
-		return fmt.Errorf("invalid choice: %d (must be 1-3)", choice)
+		return fmt.Errorf("invalid choice: %q (must be 1-4)", input)
 	}
 }
 
@@ -386,5 +616,74 @@ func (c *CLI) markAllAsRead(ctx context.Context) error {
 
 	fmt.Println("All rooms marked as read successfully")
 	c.log.Info("Mark as read action completed successfully")
+	return nil
+}
+
+func (c *CLI) leaveInactiveRooms(ctx context.Context) error {
+	fmt.Println("\nLeave Inactive Rooms")
+	fmt.Println("This feature will leave ALL rooms that have been inactive for a specified number of days.")
+	fmt.Print("\nEnter number of days (1-365): ")
+	var input string
+	if _, err := fmt.Scanln(&input); err != nil {
+		return fmt.Errorf("failed to read number of days: %w", err)
+	}
+
+	days, err := strconv.Atoi(strings.TrimSpace(input))
+	if err != nil || days < 1 || days > 365 {
+		return fmt.Errorf("please enter a valid number between 1 and 365")
+	}
+
+	return c.leaveInactiveRoomsWithConfig(ctx, days, false)
+}
+
+func (c *CLI) leaveInactiveRoomsWithConfig(ctx context.Context, days int, skipConfirm bool) error {
+	if days <= 0 || days > 365 {
+		return fmt.Errorf("days parameter must be between 1 and 365")
+	}
+
+	fmt.Printf("Finding all rooms inactive for %d days...\n", days)
+
+	roomsToLeave, roomsToKeep, err := c.actions.FindInactiveRoomsToLeave(ctx, days)
+	if err != nil {
+		return fmt.Errorf("failed to analyze rooms: %w", err)
+	}
+
+	if len(roomsToLeave) == 0 {
+		fmt.Println("\nNo inactive rooms found for the specified period.")
+		return nil
+	}
+
+	warnColor.Printf("\nWARNING: The following %d rooms will be left (this action is irreversible):\n", len(roomsToLeave))
+	for i, roomInfo := range roomsToLeave {
+		fmt.Printf("%2d. %s\n", i+1, roomInfo.Room.Name)
+		fmt.Printf("    Reason: %s\n", roomInfo.Reason)
+	}
+	fmt.Printf("\nRooms to keep: %d\n", len(roomsToKeep))
+
+	if !skipConfirm {
+		fmt.Print("\nAre you sure you want to leave these rooms? This cannot be undone. (y/n): ")
+		var confirmation string
+		if _, err := fmt.Scanln(&confirmation); err != nil {
+			return fmt.Errorf("failed to read confirmation: %w", err)
+		}
+		confirmation = strings.ToLower(strings.TrimSpace(confirmation))
+
+		if confirmation != "y" && confirmation != "yes" {
+			fmt.Println("Operation cancelled by user.")
+			return nil
+		}
+	}
+
+	fmt.Println("\nLeaving rooms...")
+	leftCount, err := c.actions.LeaveRooms(ctx, roomsToLeave)
+	if err != nil {
+		return fmt.Errorf("error during room leaving process: %w", err)
+	}
+
+	fmt.Printf("\nResults:\n")
+	fmt.Printf("- Rooms left (inactive for %d days): %d of %d\n", days, leftCount, len(roomsToLeave))
+	fmt.Printf("- Rooms kept: %d\n", len(roomsToKeep))
+
+	c.log.Info("Leave inactive rooms action completed successfully")
 	return nil
 }

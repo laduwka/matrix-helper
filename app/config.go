@@ -15,6 +15,7 @@ type MatrixConfig struct {
 	Username    string `envconfig:"USERNAME" required:"true"`
 	Password    string `envconfig:"PASSWORD" required:"true"`
 	DisplayName string `envconfig:"DISPLAY_NAME"`
+	DeviceID    string `envconfig:"DEVICE_ID"`
 
 	HomeserverURL string `envconfig:"-"`
 }
@@ -25,6 +26,7 @@ func (m MatrixConfig) ToMatrixConfig() helper.Config {
 		Username:      m.Username,
 		Password:      m.Password,
 		HomeserverURL: m.HomeserverURL,
+		DeviceID:      m.DeviceID,
 	}
 }
 
@@ -56,10 +58,25 @@ func Load() (*Config, error) {
 func NewDefault() *Config {
 	return &Config{
 		Matrix: MatrixConfig{
-			Domain:        "matrix.org",
+			Domain:        "matrix.bingo-boom.ru",
 			Username:      "test_user",
 			Password:      "test_password",
-			HomeserverURL: "https://matrix.org",
+			HomeserverURL: "https://matrix.bingo-boom.ru",
+		},
+		Log: LogConfig{
+			Level:  "info",
+			Format: "text",
+		},
+	}
+}
+
+func LoadFromValues(domain, username, password string) *Config {
+	return &Config{
+		Matrix: MatrixConfig{
+			Domain:        domain,
+			Username:      username,
+			Password:      password,
+			HomeserverURL: "https://" + domain,
 		},
 		Log: LogConfig{
 			Level:  "info",

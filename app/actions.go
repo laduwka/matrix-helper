@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/laduwka/matrix-helper/helper"
@@ -13,8 +14,11 @@ import (
 	"golang.org/x/sync/semaphore"
 )
 
+type ProgressFunc func(current, total int, message string)
+
 type ActionService interface {
 	FindRoomsToLeave(ctx context.Context, days int) ([]RoomToLeave, []helper.Room, error)
+	FindInactiveRoomsToLeave(ctx context.Context, days int) ([]RoomToLeave, []helper.Room, error)
 	LeaveRooms(ctx context.Context, roomsToLeave []RoomToLeave) (int, error)
 	LeaveByDate(ctx context.Context, days int) (leftCount, remainCount int, err error)
 
@@ -43,6 +47,7 @@ type Actions struct {
 	client         helper.Client
 	log            *logrus.Logger
 	maxConcurrency int
+	onProgress     ProgressFunc
 }
 
 type ServiceOption func(*Actions)
@@ -56,6 +61,18 @@ func WithConcurrency(n int) ServiceOption {
 func WithLogger(log *logrus.Logger) ServiceOption {
 	return func(a *Actions) {
 		a.log = log
+	}
+}
+
+func WithProgress(fn ProgressFunc) ServiceOption {
+	return func(a *Actions) {
+		a.onProgress = fn
+	}
+}
+
+func (a *Actions) reportProgress(current, total int, msg string) {
+	if a.onProgress != nil {
+		a.onProgress(current, total, msg)
 	}
 }
 
@@ -80,8 +97,9 @@ type RoomToLeave struct {
 
 func (a *Actions) FindRoomsToLeave(ctx context.Context, days int) ([]RoomToLeave, []helper.Room, error) {
 	a.log.Debug("Fetching rooms to analyze")
+	a.reportProgress(0, 0, "Fetching room list...")
 
-	rooms, err := a.client.GetRooms(ctx)
+	rooms, err := a.client.GetRoomsViaSync(ctx)
 	if err != nil {
 		return nil, nil, helper.Wrap(err, "failed to fetch rooms")
 	}
@@ -91,9 +109,13 @@ func (a *Actions) FindRoomsToLeave(ctx context.Context, days int) ([]RoomToLeave
 		limitTimestamp = helper.GetLimitTimestamp(days)
 	}
 
+	total := len(rooms)
+	a.reportProgress(0, total, "Analyzing rooms...")
+
 	var roomsToLeave []RoomToLeave
 	var roomsToKeep []helper.Room
 	var mu sync.Mutex
+	var processed atomic.Int32
 
 	g, ctx := errgroup.WithContext(ctx)
 	sem := semaphore.NewWeighted(int64(a.maxConcurrency))
@@ -117,6 +139,9 @@ func (a *Actions) FindRoomsToLeave(ctx context.Context, days int) ([]RoomToLeave
 				mu.Lock()
 				roomsToKeep = append(roomsToKeep, room)
 				mu.Unlock()
+
+				cur := int(processed.Add(1))
+				a.reportProgress(cur, total, "Analyzing rooms")
 				return nil
 			}
 
@@ -127,6 +152,9 @@ func (a *Actions) FindRoomsToLeave(ctx context.Context, days int) ([]RoomToLeave
 				roomsToKeep = append(roomsToKeep, room)
 			}
 			mu.Unlock()
+
+			cur := int(processed.Add(1))
+			a.reportProgress(cur, total, "Analyzing rooms")
 
 			return nil
 		})
@@ -144,10 +172,12 @@ func (a *Actions) LeaveRooms(ctx context.Context, roomsToLeave []RoomToLeave) (i
 		return 0, nil
 	}
 
-	a.log.Infof("Starting to leave %d rooms", len(roomsToLeave))
+	total := len(roomsToLeave)
+	a.log.Infof("Starting to leave %d rooms", total)
 
 	leftCount := 0
 	var mu sync.Mutex
+	var processed atomic.Int32
 
 	g, ctx := errgroup.WithContext(ctx)
 	sem := semaphore.NewWeighted(int64(a.maxConcurrency))
@@ -162,14 +192,17 @@ func (a *Actions) LeaveRooms(ctx context.Context, roomsToLeave []RoomToLeave) (i
 			defer sem.Release(1)
 
 			room := roomInfo.Room
-			if err := a.client.LeaveRoom(ctx, room.ID); err != nil {
+			if err := a.client.LeaveRoom(ctx, room.ID, room.Name); err != nil {
 				a.log.WithError(err).WithFields(logrus.Fields{
 					"room_id":   room.ID,
 					"room_name": room.Name,
 				}).Warn("Failed to leave room")
+
+				cur := int(processed.Add(1))
+				a.reportProgress(cur, total, "Leaving rooms")
 				return nil
 			}
-			time.Sleep(100 * time.Millisecond)
+
 			a.log.WithField("room_name", room.Name).Info("Successfully left room")
 			a.log.WithFields(logrus.Fields{
 				"room_id":   room.ID,
@@ -180,6 +213,9 @@ func (a *Actions) LeaveRooms(ctx context.Context, roomsToLeave []RoomToLeave) (i
 			mu.Lock()
 			leftCount++
 			mu.Unlock()
+
+			cur := int(processed.Add(1))
+			a.reportProgress(cur, total, "Leaving rooms")
 
 			return nil
 		})
@@ -212,51 +248,47 @@ func (a *Actions) LeaveByDate(ctx context.Context, days int) (leftCount, remainC
 
 func (a *Actions) FindMentionedRooms(ctx context.Context, days int) ([]ActionRoom, error) {
 	a.log.Debug("Finding rooms with mentions")
+	a.reportProgress(0, 0, "Fetching room list...")
 
-	rooms, err := a.client.GetRooms(ctx)
+	rooms, err := a.client.GetRoomsViaSync(ctx)
 	if err != nil {
 		return nil, helper.Wrap(err, "failed to fetch rooms")
 	}
 
-	limitTimestamp := helper.GetLimitTimestamp(days)
-	var mentionedRooms []ActionRoom
-	var mu sync.Mutex
-
-	g, ctx := errgroup.WithContext(ctx)
-	sem := semaphore.NewWeighted(int64(a.maxConcurrency))
-
-	for _, room := range rooms {
-		room := room
-		g.Go(func() error {
-
-			if err := sem.Acquire(ctx, 1); err != nil {
-				return helper.Wrap(err, "failed to acquire semaphore")
-			}
-			defer sem.Release(1)
-
-			mentioned, err := a.checkRoomMentions(ctx, room.ID, limitTimestamp)
-			if err != nil {
-				a.log.WithError(err).WithField("room_id", room.ID).Warn("Failed to check mentions")
-				return nil
-			}
-
-			if mentioned {
-				mu.Lock()
-				domain := a.client.Config().Domain
-				mentionedRooms = append(mentionedRooms, ActionRoom{
-					ID:          room.ID,
-					Name:        room.Name,
-					WebLink:     fmt.Sprintf("https://%s/#/room/%s", domain, room.ID),
-					ElementLink: fmt.Sprintf("element://vector/webapp/#/room/%s", room.ID),
-				})
-				mu.Unlock()
-			}
-			return nil
-		})
+	roomNames := make(map[string]string, len(rooms))
+	for _, r := range rooms {
+		roomNames[r.ID] = r.Name
 	}
 
-	if err := g.Wait(); err != nil {
-		return mentionedRooms, helper.Wrap(err, "error while checking mentions")
+	a.reportProgress(0, 0, "Fetching notifications...")
+
+	limitTimestamp := helper.GetLimitTimestamp(days)
+	notifications, err := a.client.GetNotifications(ctx, limitTimestamp)
+	if err != nil {
+		return nil, helper.Wrap(err, "failed to fetch notifications")
+	}
+
+	domain := a.client.Config().Domain
+	seen := make(map[string]bool)
+	var mentionedRooms []ActionRoom
+
+	for _, n := range notifications {
+		if seen[n.RoomID] {
+			continue
+		}
+		seen[n.RoomID] = true
+
+		name := roomNames[n.RoomID]
+		if name == "" {
+			name = n.RoomID
+		}
+
+		mentionedRooms = append(mentionedRooms, ActionRoom{
+			ID:          n.RoomID,
+			Name:        name,
+			WebLink:     fmt.Sprintf("https://%s/#/room/%s", domain, n.RoomID),
+			ElementLink: fmt.Sprintf("element://vector/webapp/#/room/%s", n.RoomID),
+		})
 	}
 
 	return mentionedRooms, nil
@@ -264,16 +296,35 @@ func (a *Actions) FindMentionedRooms(ctx context.Context, days int) ([]ActionRoo
 
 func (a *Actions) MarkAllRoomsAsRead(ctx context.Context) error {
 	a.log.Debug("Starting to mark all rooms as read")
+	a.reportProgress(0, 0, "Fetching room list...")
 
-	rooms, err := a.client.GetRooms(ctx)
+	rooms, err := a.client.GetRoomsViaSync(ctx)
 	if err != nil {
 		return helper.Wrap(err, "failed to fetch rooms")
 	}
 
+	var unreadRooms []helper.Room
+	for _, room := range rooms {
+		if room.NotificationCount > 0 {
+			unreadRooms = append(unreadRooms, room)
+		}
+	}
+
+	a.log.Debugf("Found %d unread rooms out of %d total", len(unreadRooms), len(rooms))
+
+	if len(unreadRooms) == 0 {
+		return nil
+	}
+
+	total := len(unreadRooms)
+	a.reportProgress(0, total, "Marking rooms as read...")
+
+	var processed atomic.Int32
+
 	g, ctx := errgroup.WithContext(ctx)
 	sem := semaphore.NewWeighted(int64(a.maxConcurrency))
 
-	for _, room := range rooms {
+	for _, room := range unreadRooms {
 		room := room
 		g.Go(func() error {
 
@@ -282,11 +333,14 @@ func (a *Actions) MarkAllRoomsAsRead(ctx context.Context) error {
 			}
 			defer sem.Release(1)
 
-			if err := a.client.MarkRoomAsRead(ctx, room.ID); err != nil {
+			if err := a.client.MarkRoomAsRead(ctx, room.ID, room.Name, room.LastEventID); err != nil {
 				a.log.WithError(err).WithField("room_id", room.ID).Error("Failed to mark room as read")
 				return helper.Wrap(err, fmt.Sprintf("failed to mark room %s as read", room.ID))
 			}
-			time.Sleep(100 * time.Millisecond)
+
+			cur := int(processed.Add(1))
+			a.reportProgress(cur, total, "Marking rooms as read")
+
 			return nil
 		})
 	}
@@ -295,7 +349,6 @@ func (a *Actions) MarkAllRoomsAsRead(ctx context.Context) error {
 		return helper.Wrap(err, "failed to mark all rooms as read")
 	}
 
-	a.log.Info("Successfully marked all rooms as read")
 	return nil
 }
 
@@ -314,26 +367,31 @@ func (a *Actions) evaluateRoom(ctx context.Context, room helper.Room, limitTimes
 		return true, "Room name contains a closing keyword", nil
 	}
 
-	lastActivity, err := a.client.GetLastMessageTimestamp(ctx, room.ID)
-	if err != nil {
+	var lastActivity int64
+	if room.LastActivity > 0 {
+		lastActivity = room.LastActivity
+	} else {
+		var err error
+		lastActivity, err = a.client.GetLastMessageTimestamp(ctx, room.ID)
+		if err != nil {
+			if strings.Contains(err.Error(), "no messages") ||
+				strings.Contains(err.Error(), "empty room") {
+				a.log.WithFields(logrus.Fields{
+					"room_id":   room.ID,
+					"room_name": room.Name,
+				}).Debug("Room has no messages, treating as inactive")
 
-		if strings.Contains(err.Error(), "no messages") ||
-			strings.Contains(err.Error(), "empty room") {
-			a.log.WithFields(logrus.Fields{
+				reason := "Room has no messages and name contains closing keyword"
+				return true, reason, nil
+			}
+
+			a.log.WithError(err).WithFields(logrus.Fields{
 				"room_id":   room.ID,
 				"room_name": room.Name,
-			}).Debug("Room has no messages, treating as inactive")
+			}).Error("Failed to get last message timestamp")
 
-			reason := "Room has no messages and name contains closing keyword"
-			return true, reason, nil
+			return false, "", helper.Wrap(err, "failed to get last message timestamp")
 		}
-
-		a.log.WithError(err).WithFields(logrus.Fields{
-			"room_id":   room.ID,
-			"room_name": room.Name,
-		}).Error("Failed to get last message timestamp")
-
-		return false, "", helper.Wrap(err, "failed to get last message timestamp")
 	}
 
 	if lastActivity < limitTimestamp {
@@ -345,17 +403,96 @@ func (a *Actions) evaluateRoom(ctx context.Context, room helper.Room, limitTimes
 	return false, "", nil
 }
 
-func (a *Actions) checkRoomMentions(ctx context.Context, roomID string, since int64) (bool, error) {
-	messages, err := a.client.GetMessages(ctx, roomID, since)
+func (a *Actions) FindInactiveRoomsToLeave(ctx context.Context, days int) ([]RoomToLeave, []helper.Room, error) {
+	a.log.Debug("Fetching rooms to analyze for inactivity")
+	a.reportProgress(0, 0, "Fetching room list...")
+
+	rooms, err := a.client.GetRoomsViaSync(ctx)
 	if err != nil {
-		return false, helper.Wrap(err, "failed to get messages")
+		return nil, nil, helper.Wrap(err, "failed to fetch rooms")
 	}
 
-	for _, msg := range messages {
-		if msg.ContainsMention(a.client.Config().Username) {
-			return true, nil
+	total := len(rooms)
+	a.reportProgress(0, total, "Analyzing rooms...")
+
+	limitTimestamp := helper.GetLimitTimestamp(days)
+
+	var roomsToLeave []RoomToLeave
+	var roomsToKeep []helper.Room
+	var mu sync.Mutex
+	var processed atomic.Int32
+
+	g, ctx := errgroup.WithContext(ctx)
+	sem := semaphore.NewWeighted(int64(a.maxConcurrency))
+
+	for _, room := range rooms {
+		room := room
+		g.Go(func() error {
+			if err := sem.Acquire(ctx, 1); err != nil {
+				return helper.Wrap(err, "failed to acquire semaphore")
+			}
+			defer sem.Release(1)
+
+			shouldLeave, reason, err := a.evaluateRoomForInactiveLeave(ctx, room, limitTimestamp)
+			if err != nil {
+				a.log.WithError(err).WithFields(logrus.Fields{
+					"room_id":   room.ID,
+					"room_name": room.Name,
+				}).Debug("Error evaluating room for inactivity")
+
+				mu.Lock()
+				roomsToKeep = append(roomsToKeep, room)
+				mu.Unlock()
+
+				cur := int(processed.Add(1))
+				a.reportProgress(cur, total, "Analyzing rooms")
+				return nil
+			}
+
+			mu.Lock()
+			if shouldLeave {
+				roomsToLeave = append(roomsToLeave, RoomToLeave{Room: room, Reason: reason})
+			} else {
+				roomsToKeep = append(roomsToKeep, room)
+			}
+			mu.Unlock()
+
+			cur := int(processed.Add(1))
+			a.reportProgress(cur, total, "Analyzing rooms")
+
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return nil, nil, helper.Wrap(err, "error in room evaluation")
+	}
+
+	return roomsToLeave, roomsToKeep, nil
+}
+
+func (a *Actions) evaluateRoomForInactiveLeave(ctx context.Context, room helper.Room, limitTimestamp int64) (bool, string, error) {
+	var lastActivity int64
+	if room.LastActivity > 0 {
+		lastActivity = room.LastActivity
+	} else {
+		var err error
+		lastActivity, err = a.client.GetLastMessageTimestamp(ctx, room.ID)
+		if err != nil {
+			if strings.Contains(err.Error(), "no messages") ||
+				strings.Contains(err.Error(), "empty room") {
+				return true, "Room has no messages", nil
+			}
+			return false, "", helper.Wrap(err, "failed to get last message timestamp")
 		}
 	}
 
-	return false, nil
+	if lastActivity < limitTimestamp {
+		daysInactive := int((time.Now().Unix()*1000 - lastActivity) / (86400 * 1000))
+		reason := fmt.Sprintf("Room inactive for %d days", daysInactive)
+		return true, reason, nil
+	}
+
+	return false, "", nil
 }
+
