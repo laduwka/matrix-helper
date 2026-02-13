@@ -2,7 +2,7 @@ name: Lint and Code Quality
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [ feature/* ]
   pull_request:
     branches: [ main, master ]
 
@@ -72,7 +72,8 @@ jobs:
         with:
           go-version: '1.24'
 
+      - name: Install Gosec
+        run: go install github.com/securego/gosec/v2/cmd/gosec@latest
+
       - name: Run Gosec Security Scanner
-        uses: securego/gosec@master
-        with:
-          args: ./...
+        run: gosec ./...

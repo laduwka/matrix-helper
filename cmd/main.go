@@ -155,7 +155,8 @@ var (
 	titleColor   = color.New(color.FgCyan, color.Bold)
 	successColor = color.New(color.FgGreen)
 	warnColor    = color.New(color.FgYellow)
-	errorColor   = color.New(color.FgRed)
+
+// errorColor   = color.New(color.FgRed)
 )
 
 var progressFn = func(current, total int, message string) {

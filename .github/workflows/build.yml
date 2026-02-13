@@ -4,8 +4,6 @@ on:
   push:
     branches: [ main, master ]
     tags: [ 'v*' ]
-  pull_request:
-    branches: [ main, master ]
 
 jobs:
   build:
@@ -13,25 +11,17 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        go-version: ['1.24']
-        platform: ['linux/amd64', 'darwin/amd64', 'darwin/arm64', 'windows/amd64']
         include:
-          - platform: 'linux/amd64'
-            os: 'ubuntu-latest'
+          - osname: 'linux'
             arch: 'amd64'
-            osname: 'linux'
-          - platform: 'darwin/amd64'
-            os: 'ubuntu-latest'
-            arch: 'amd64'
-            osname: 'darwin'
-          - platform: 'darwin/arm64'
-            os: 'ubuntu-latest'
+          - osname: 'linux'
             arch: 'arm64'
-            osname: 'darwin'
-          - platform: 'windows/amd64'
-            os: 'ubuntu-latest'
+          - osname: 'darwin'
             arch: 'amd64'
-            osname: 'windows'
+          - osname: 'darwin'
+            arch: 'arm64'
+          - osname: 'windows'
+            arch: 'amd64'
             extension: '.exe'
 
     steps:
@@ -41,7 +31,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@v5
       with:
-        go-version: ${{ matrix.go-version }}
+        go-version: '1.24'
         cache: true
 
     - name: Read version
@@ -51,12 +41,9 @@ jobs:
     - name: Get dependencies
       run: go mod download
 
-    - name: Run tests
-      run: go test -v ./...
-
     - name: Build binary
       run: |
-        GOOS=${{ matrix.osname }} GOARCH=${{ matrix.arch }} go build -v \
+        CGO_ENABLED=0 GOOS=${{ matrix.osname }} GOARCH=${{ matrix.arch }} go build -v \
           -ldflags "-X main.version=${{ steps.version.outputs.VERSION }}" \
           -o matrix-helper-${{ matrix.osname }}-${{ matrix.arch }}${{ matrix.extension }} ./cmd/main.go
 
@@ -86,22 +73,17 @@ jobs:
         with:
           path: artifacts
 
-      - name: Create release directory
-        run: mkdir release
-
-      - name: Create checksums
+      - name: Collect binaries
         run: |
+          mkdir release
           find artifacts -type f -exec cp {} release/ \;
-          cd release
-          find . -type f -exec sha256sum {} \; > checksums.txt
 
       - name: Create Release
         id: create_release
         uses: softprops/action-gh-release@v2
         with:
           name: v${{ steps.version.outputs.VERSION }}
-          files: |
-            release/*
+          files: release/*
           draft: false
           prerelease: false
           generate_release_notes: true

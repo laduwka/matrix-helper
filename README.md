@@ -36,7 +36,7 @@ Pre-built binaries for your platform are available on the [GitHub Releases page]
 
 ## Configuration
 
-### Environment variables
+### Environment variables (CLI Mode Only)
 
 ```bash
 # Required
