@@ -13,7 +13,7 @@ type Config struct {
 type MatrixConfig struct {
 	Domain      string `envconfig:"DOMAIN" required:"true"`
 	Username    string `envconfig:"USERNAME" required:"true"`
-	Password    string `envconfig:"PASSWORD" required:"true"`
+	Password    string `envconfig:"PASSWORD" required:"true"` // #nosec G117 -- read from env, never serialized
 	DisplayName string `envconfig:"DISPLAY_NAME"`
 	DeviceID    string `envconfig:"DEVICE_ID"`
 

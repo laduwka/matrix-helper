@@ -152,11 +152,11 @@ func printHelp() {
 }
 
 var (
-	titleColor   = color.New(color.FgCyan, color.Bold)
-	successColor = color.New(color.FgGreen)
-	warnColor    = color.New(color.FgYellow)
-
-// errorColor   = color.New(color.FgRed)
+	titlePrintln   = color.New(color.FgCyan, color.Bold).PrintlnFunc()
+	successPrintln = color.New(color.FgGreen).PrintlnFunc()
+	successPrintf  = color.New(color.FgGreen).PrintfFunc()
+	warnPrintln    = color.New(color.FgYellow).PrintlnFunc()
+	warnPrintf     = color.New(color.FgYellow).PrintfFunc()
 )
 
 var progressFn = func(current, total int, message string) {
@@ -223,8 +223,8 @@ func setupSignalHandler(cancel context.CancelFunc) {
 func promptCredentials() (domain, username, password string, err error) {
 	reader := bufio.NewReader(os.Stdin)
 
-	titleColor.Println("Matrix Helper - Interactive Setup")
-	titleColor.Println("==================================")
+	titlePrintln("Matrix Helper - Interactive Setup")
+	titlePrintln("==================================")
 	fmt.Println()
 
 	fmt.Print("Matrix homeserver domain [matrix.bingo-boom.ru]: ")
@@ -296,21 +296,21 @@ func initializeInteractiveApp() (*CLI, error) {
 	// Try cached token first
 	cached, err := helper.LoadToken()
 	if err != nil {
-		warnColor.Printf("Warning: failed to load cached session: %v\n", err)
+		warnPrintf("Warning: failed to load cached session: %v\n", err)
 	}
 
 	if cached != nil {
-		successColor.Printf("Found cached session for %s\n", cached.UserID)
-		successColor.Printf("Connecting to %s...\n", cached.HomeserverURL)
+		successPrintf("Found cached session for %s\n", cached.UserID)
+		successPrintf("Connecting to %s...\n", cached.HomeserverURL)
 
 		client, err := helper.NewClientFromToken(cached, log, interactiveClientOpts(log)...)
 		if err != nil {
-			warnColor.Printf("Cached session is invalid: %v\n", err)
-			warnColor.Println("Falling back to credential prompt...")
+			warnPrintf("Cached session is invalid: %v\n", err)
+			warnPrintln("Falling back to credential prompt...")
 			_ = helper.RemoveToken()
 			fmt.Println()
 		} else {
-			successColor.Println("Connected successfully!")
+			successPrintln("Connected successfully!")
 			fmt.Println()
 
 			actionService := app.NewActions(
@@ -333,7 +333,7 @@ func initializeInteractiveApp() (*CLI, error) {
 	log = app.NewLogger(cfg.Log.ToLoggerConfig())
 
 	fmt.Println()
-	successColor.Printf("Connecting to %s...\n", cfg.Matrix.HomeserverURL)
+	successPrintf("Connecting to %s...\n", cfg.Matrix.HomeserverURL)
 
 	client, err := helper.NewClient(
 		cfg.Matrix.ToMatrixConfig(),
@@ -344,7 +344,7 @@ func initializeInteractiveApp() (*CLI, error) {
 		return nil, fmt.Errorf("failed to initialize matrix client: %w", err)
 	}
 
-	successColor.Println("Connected successfully!")
+	successPrintln("Connected successfully!")
 
 	// Cache the token for future runs
 	token := &helper.CachedToken{
@@ -357,9 +357,9 @@ func initializeInteractiveApp() (*CLI, error) {
 		CreatedAt:     time.Now(),
 	}
 	if err := helper.SaveToken(token); err != nil {
-		warnColor.Printf("Warning: failed to cache session: %v\n", err)
+		warnPrintf("Warning: failed to cache session: %v\n", err)
 	} else {
-		successColor.Println("Session cached for future runs")
+		successPrintln("Session cached for future runs")
 	}
 	fmt.Println()
 
@@ -388,12 +388,12 @@ func runLogout() error {
 
 	fmt.Printf("Logging out session for %s...\n", token.UserID)
 	if err := helper.LogoutAndCleanup(token); err != nil {
-		warnColor.Printf("Warning: server-side logout failed: %v\n", err)
+		warnPrintf("Warning: server-side logout failed: %v\n", err)
 		fmt.Println("Local token has been removed.")
 		return nil
 	}
 
-	successColor.Println("Logged out successfully. Cached session removed.")
+	successPrintln("Logged out successfully. Cached session removed.")
 	return nil
 }
 
@@ -460,8 +460,8 @@ func initializeApp() (*CLI, error) {
 }
 
 func (c *CLI) RunCLI(ctx context.Context) error {
-	titleColor.Println("Matrix Helper")
-	titleColor.Println("=============")
+	titlePrintln("Matrix Helper")
+	titlePrintln("=============")
 	fmt.Println("Choose an action:")
 	fmt.Println("  1. Leave rooms (with closing keywords)")
 	fmt.Println("  2. Find rooms with mentions")
@@ -654,7 +654,7 @@ func (c *CLI) leaveInactiveRoomsWithConfig(ctx context.Context, days int, skipCo
 		return nil
 	}
 
-	warnColor.Printf("\nWARNING: The following %d rooms will be left (this action is irreversible):\n", len(roomsToLeave))
+	warnPrintf("\nWARNING: The following %d rooms will be left (this action is irreversible):\n", len(roomsToLeave))
 	for i, roomInfo := range roomsToLeave {
 		fmt.Printf("%2d. %s\n", i+1, roomInfo.Room.Name)
 		fmt.Printf("    Reason: %s\n", roomInfo.Reason)

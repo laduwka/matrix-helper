@@ -13,7 +13,7 @@ import (
 type Config struct {
 	HomeserverURL string
 	Username      string
-	Password      string
+	Password      string // #nosec G117 -- used only for login, never serialized
 	Domain        string
 	DeviceID      string
 }
