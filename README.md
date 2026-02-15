@@ -127,7 +127,7 @@ The tool automatically limits request frequency to the Matrix server (20 request
 
 ## License
 
-MIT License
+GPL-3.0
 
 ## Credits
 
