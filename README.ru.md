@@ -168,7 +168,7 @@ matrix-helper --logout
 
 ## Лицензия
 
-MIT License
+GPL-3.0
 
 ## Зависимости
 
