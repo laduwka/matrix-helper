@@ -15,3 +15,6 @@ matrix-helper
 config.local.yaml
 .env
 .claude
+
+# GoReleaser
+dist/
