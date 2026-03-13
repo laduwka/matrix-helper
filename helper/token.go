@@ -11,7 +11,7 @@ import (
 type CachedToken struct {
 	HomeserverURL string    `json:"homeserver_url"`
 	UserID        string    `json:"user_id"`
-	AccessToken   string    `json:"access_token"` // #nosec G117 -- stored in local cache file with 0600 permissions
+	AccessToken   string    `json:"access_token"`
 	DeviceID      string    `json:"device_id"`
 	Username      string    `json:"username"`
 	Domain        string    `json:"domain"`
@@ -37,7 +37,7 @@ func SaveToken(token *CachedToken) error {
 		return Wrap(err, "failed to create token cache directory")
 	}
 
-	data, err := json.Marshal(token)
+	data, err := json.Marshal(token) // #nosec G117 -- stored in local cache file with 0600 permissions
 	if err != nil {
 		return Wrap(err, "failed to marshal token")
 	}
