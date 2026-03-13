@@ -1,7 +1,9 @@
-.PHONY: build test lint clean release-local
+.PHONY: build test lint coverage clean release-local
+
+VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 
 build:
-	CGO_ENABLED=0 go build -v -o matrix-helper ./cmd/main.go
+	CGO_ENABLED=0 go build -v -ldflags "-X main.version=$(VERSION)" -o matrix-helper ./cmd/main.go
 
 test:
 	go test -v -race ./...

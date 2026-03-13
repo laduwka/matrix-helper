@@ -1,10 +1,6 @@
 version: 2
 project_name: matrix-helper
 
-before:
-  hooks:
-    - go mod tidy
-
 builds:
   - main: ./cmd/main.go
     env:
