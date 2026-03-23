@@ -290,7 +290,7 @@ func TestSmartBackOff_UsesServerDelayFor429(t *testing.T) {
 }
 
 func TestSmartBackOff_FallsBackToInnerForNon429(t *testing.T) {
-	var lastErr error = errors.New("some error")
+	var lastErr = errors.New("some error") //nolint:staticcheck
 	inner := &mockBackOff{nextDelay: 200 * time.Millisecond}
 	sb := &smartBackOff{inner: inner, lastErr: &lastErr, maxRetries: 2}
 

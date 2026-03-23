@@ -1,7 +1,6 @@
 package app
 
 import (
-	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -9,14 +8,9 @@ import (
 )
 
 func TestLoad_AllVarsSet(t *testing.T) {
-	os.Setenv("MATRIX_DOMAIN", "matrix.example.com")
-	os.Setenv("MATRIX_USERNAME", "testuser")
-	os.Setenv("MATRIX_PASSWORD", "testpass")
-	defer func() {
-		os.Unsetenv("MATRIX_DOMAIN")
-		os.Unsetenv("MATRIX_USERNAME")
-		os.Unsetenv("MATRIX_PASSWORD")
-	}()
+	t.Setenv("MATRIX_DOMAIN", "matrix.example.com")
+	t.Setenv("MATRIX_USERNAME", "testuser")
+	t.Setenv("MATRIX_PASSWORD", "testpass")
 
 	cfg, err := Load()
 	require.NoError(t, err)
@@ -28,14 +22,9 @@ func TestLoad_AllVarsSet(t *testing.T) {
 }
 
 func TestLoad_DefaultLogConfig(t *testing.T) {
-	os.Setenv("MATRIX_DOMAIN", "matrix.example.com")
-	os.Setenv("MATRIX_USERNAME", "testuser")
-	os.Setenv("MATRIX_PASSWORD", "testpass")
-	defer func() {
-		os.Unsetenv("MATRIX_DOMAIN")
-		os.Unsetenv("MATRIX_USERNAME")
-		os.Unsetenv("MATRIX_PASSWORD")
-	}()
+	t.Setenv("MATRIX_DOMAIN", "matrix.example.com")
+	t.Setenv("MATRIX_USERNAME", "testuser")
+	t.Setenv("MATRIX_PASSWORD", "testpass")
 
 	cfg, err := Load()
 	require.NoError(t, err)
@@ -46,9 +35,9 @@ func TestLoad_DefaultLogConfig(t *testing.T) {
 }
 
 func TestLoad_MissingRequired(t *testing.T) {
-	os.Unsetenv("MATRIX_DOMAIN")
-	os.Unsetenv("MATRIX_USERNAME")
-	os.Unsetenv("MATRIX_PASSWORD")
+	t.Setenv("MATRIX_DOMAIN", "")
+	t.Setenv("MATRIX_USERNAME", "")
+	t.Setenv("MATRIX_PASSWORD", "")
 
 	_, err := Load()
 	assert.Error(t, err)
