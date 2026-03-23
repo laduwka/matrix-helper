@@ -1,6 +1,8 @@
 package app
 
 import (
+	"fmt"
+
 	"github.com/kelseyhightower/envconfig"
 	"github.com/laduwka/matrix-helper/helper"
 )
@@ -48,6 +50,10 @@ func Load() (*Config, error) {
 	var cfg Config
 	if err := envconfig.Process("", &cfg); err != nil {
 		return nil, err
+	}
+
+	if cfg.Matrix.Domain == "" || cfg.Matrix.Username == "" || cfg.Matrix.Password == "" {
+		return nil, fmt.Errorf("MATRIX_DOMAIN, MATRIX_USERNAME, and MATRIX_PASSWORD must be non-empty")
 	}
 
 	cfg.Matrix.HomeserverURL = "https://" + cfg.Matrix.Domain
